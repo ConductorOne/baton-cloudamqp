@@ -3,7 +3,6 @@ package connector
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/ConductorOne/baton-cloudamqp/pkg/cloudamqp"
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
@@ -25,7 +24,6 @@ func (u *userResourceType) ResourceType(_ context.Context) *v2.ResourceType {
 func userResource(ctx context.Context, user *cloudamqp.User) (*v2.Resource, error) {
 	profile := map[string]interface{}{
 		"login": user.Email,
-		"roles": strings.Join(user.Roles, ","),
 	}
 
 	ret, err := resource.NewUserResource(
