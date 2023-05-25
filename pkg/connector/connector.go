@@ -2,39 +2,71 @@ package connector
 
 import (
 	"context"
-	"fmt"
 
+	"github.com/ConductorOne/baton-cloudamqp/pkg/cloudamqp"
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
+	"github.com/conductorone/baton-sdk/pkg/annotations"
+	"github.com/conductorone/baton-sdk/pkg/connectorbuilder"
+	"github.com/conductorone/baton-sdk/pkg/uhttp"
+	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
-// TODO: implement your connector here
-type connectorImpl struct {
+var (
+	resourceTypeUser = &v2.ResourceType{
+		Id:          "user",
+		DisplayName: "User",
+		Traits: []v2.ResourceType_Trait{
+			v2.ResourceType_TRAIT_USER,
+		},
+	}
+	resourceTypeRole = &v2.ResourceType{
+		Id:          "role",
+		DisplayName: "Role",
+		Traits: []v2.ResourceType_Trait{
+			v2.ResourceType_TRAIT_ROLE,
+		},
+	}
+)
+
+type CloudAMQP struct {
+	client *cloudamqp.Client
 }
 
-func (c *connectorImpl) ListResourceTypes(ctx context.Context, req *v2.ResourceTypesServiceListResourceTypesRequest) (*v2.ResourceTypesServiceListResourceTypesResponse, error) {
-	return nil, fmt.Errorf("not implemented")
+func (pd *CloudAMQP) ResourceSyncers(ctx context.Context) []connectorbuilder.ResourceSyncer {
+	return []connectorbuilder.ResourceSyncer{
+		userBuilder(pd.client),
+		roleBuilder(pd.client),
+	}
 }
 
-func (c *connectorImpl) ListResources(ctx context.Context, req *v2.ResourcesServiceListResourcesRequest) (*v2.ResourcesServiceListResourcesResponse, error) {
-	return nil, fmt.Errorf("not implemented")
+// Metadata returns metadata about the connector.
+func (pd *CloudAMQP) Metadata(ctx context.Context) (*v2.ConnectorMetadata, error) {
+	return &v2.ConnectorMetadata{
+		DisplayName: "CloudAMQP",
+	}, nil
 }
 
-func (c *connectorImpl) ListEntitlements(ctx context.Context, req *v2.EntitlementsServiceListEntitlementsRequest) (*v2.EntitlementsServiceListEntitlementsResponse, error) {
-	return nil, fmt.Errorf("not implemented")
+// Validate hits the CloudAMQP API to validate that the configured credentials are valid and compatible.
+func (pd *CloudAMQP) Validate(ctx context.Context) (annotations.Annotations, error) {
+	// should be able to list users
+	_, err := pd.client.GetUsers(ctx)
+	if err != nil {
+		return nil, status.Error(codes.Unauthenticated, "Provided Access Token is invalid")
+	}
+
+	return nil, nil
 }
 
-func (c *connectorImpl) ListGrants(ctx context.Context, req *v2.GrantsServiceListGrantsRequest) (*v2.GrantsServiceListGrantsResponse, error) {
-	return nil, fmt.Errorf("not implemented")
-}
+// New returns the CloudAMQP connector.
+func New(ctx context.Context, password string) (*CloudAMQP, error) {
+	httpClient, err := uhttp.NewClient(ctx, uhttp.WithLogger(true, ctxzap.Extract(ctx)))
+	if err != nil {
+		return nil, err
+	}
 
-func (c *connectorImpl) GetMetadata(ctx context.Context, req *v2.ConnectorServiceGetMetadataRequest) (*v2.ConnectorServiceGetMetadataResponse, error) {
-	return nil, fmt.Errorf("not implemented")
-}
-
-func (c *connectorImpl) Validate(ctx context.Context, req *v2.ConnectorServiceValidateRequest) (*v2.ConnectorServiceValidateResponse, error) {
-	return nil, fmt.Errorf("not implemented")
-}
-
-func (c *connectorImpl) GetAsset(req *v2.AssetServiceGetAssetRequest, server v2.AssetService_GetAssetServer) error {
-	return fmt.Errorf("not implemented")
+	return &CloudAMQP{
+		client: cloudamqp.NewClient(httpClient, password),
+	}, nil
 }
