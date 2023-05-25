@@ -23,7 +23,8 @@ func (u *userResourceType) ResourceType(_ context.Context) *v2.ResourceType {
 // Create a new connector resource for a CloudAMQP User.
 func userResource(ctx context.Context, user *cloudamqp.User) (*v2.Resource, error) {
 	profile := map[string]interface{}{
-		"login": user.Email,
+		"login":   user.Email,
+		"user_id": user.Id,
 	}
 
 	ret, err := resource.NewUserResource(
