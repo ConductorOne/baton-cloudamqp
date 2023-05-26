@@ -14,15 +14,16 @@ import (
 )
 
 const (
-	roleAdmin          = "admin"
-	roleDevops         = "devops"
-	roleMember         = "member"
-	roleMonitor        = "monitor"
-	roleBillingManager = "billing manager"
+	roleAdmin             = "admin"
+	roleDevops            = "devops"
+	roleMember            = "member"
+	roleMonitor           = "monitor"
+	roleBillingManager    = "billing manager"
+	roleComplianceManager = "compliance manager"
 )
 
 var teamAccessRoles = []string{
-	roleAdmin, roleDevops, roleMember, roleMonitor, roleBillingManager,
+	roleAdmin, roleDevops, roleMember, roleMonitor, roleBillingManager, roleComplianceManager,
 }
 
 type roleResourceType struct {
