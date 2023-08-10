@@ -11,6 +11,8 @@ import (
 	ent "github.com/conductorone/baton-sdk/pkg/types/entitlement"
 	"github.com/conductorone/baton-sdk/pkg/types/grant"
 	rs "github.com/conductorone/baton-sdk/pkg/types/resource"
+	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
+	"go.uber.org/zap"
 )
 
 const (
@@ -112,6 +114,53 @@ func (r *roleResourceType) Grants(ctx context.Context, resource *v2.Resource, _ 
 	}
 
 	return rv, "", nil, nil
+}
+
+func (r *roleResourceType) Grant(ctx context.Context, principal *v2.Resource, entitlement *v2.Entitlement) (annotations.Annotations, error) {
+	l := ctxzap.Extract(ctx)
+
+	if principal.Id.ResourceType != resourceTypeUser.Id {
+		l.Warn(
+			"cloudamqp-connector: only users can be granted roles",
+			zap.String("principal_id", principal.Id.String()),
+			zap.String("principal_type", principal.Id.ResourceType),
+		)
+
+		return nil, fmt.Errorf("cloudamqp-connector: only users can be granted roles")
+	}
+
+	userId, roleId := principal.Id.Resource, entitlement.Resource.Id.Resource
+	err := r.client.UpdateUserRole(ctx, userId, roleId)
+	if err != nil {
+		return nil, fmt.Errorf("cloudamqp-connector: failed to update user role: %w", err)
+	}
+
+	return nil, nil
+}
+
+// Since user always has a role, this function will assign the user to the default role - member.
+func (r *roleResourceType) Revoke(ctx context.Context, grant *v2.Grant) (annotations.Annotations, error) {
+	l := ctxzap.Extract(ctx)
+
+	principal := grant.Principal
+
+	if principal.Id.ResourceType != resourceTypeUser.Id {
+		l.Warn(
+			"cloudamqp-connector: only users can have roles revoked",
+			zap.String("principal_id", principal.Id.String()),
+			zap.String("principal_type", principal.Id.ResourceType),
+		)
+
+		return nil, fmt.Errorf("cloudamqp-connector: only users can have roles revoked")
+	}
+
+	userId, roleId := principal.Id.Resource, roleMember
+	err := r.client.UpdateUserRole(ctx, userId, roleId)
+	if err != nil {
+		return nil, fmt.Errorf("cloudamqp-connector: failed to update user role: %w", err)
+	}
+
+	return nil, nil
 }
 
 func roleBuilder(client *cloudamqp.Client) *roleResourceType {
