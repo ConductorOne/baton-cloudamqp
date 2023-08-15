@@ -39,7 +39,7 @@ func (r *roleResourceType) ResourceType(_ context.Context) *v2.ResourceType {
 
 // roleResource creates a new connector resource for a CloudAMQP Role.
 func roleResource(role string) (*v2.Resource, error) {
-	displayName := titleCaser.String(role)
+	displayName := titleCase(role)
 	profile := map[string]interface{}{
 		"role_id":   role,
 		"role_name": displayName,
