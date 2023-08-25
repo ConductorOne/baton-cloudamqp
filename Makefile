@@ -1,7 +1,12 @@
 GOOS = $(shell go env GOOS)
 GOARCH = $(shell go env GOARCH)
 BUILD_DIR = dist/${GOOS}_${GOARCH}
+
+ifeq ($(GOOS),windows)
+OUTPUT_PATH = ${BUILD_DIR}/baton-cloudamqp.exe
+else
 OUTPUT_PATH = ${BUILD_DIR}/baton-cloudamqp
+endif
 
 .PHONY: build
 build:
