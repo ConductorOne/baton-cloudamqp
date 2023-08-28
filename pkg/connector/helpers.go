@@ -9,7 +9,11 @@ import (
 
 const ResourcesPageSize = 50
 
-var titleCaser = cases.Title(language.English)
+func titleCase(s string) string {
+	titleCaser := cases.Title(language.English)
+
+	return titleCaser.String(s)
+}
 
 func annotationsForUserResourceType() annotations.Annotations {
 	annos := annotations.Annotations{}
