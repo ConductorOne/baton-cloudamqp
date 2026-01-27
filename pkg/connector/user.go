@@ -7,9 +7,12 @@ import (
 	"github.com/conductorone/baton-cloudamqp/pkg/cloudamqp"
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
 	"github.com/conductorone/baton-sdk/pkg/annotations"
+	"github.com/conductorone/baton-sdk/pkg/connectorbuilder"
 	"github.com/conductorone/baton-sdk/pkg/pagination"
 	"github.com/conductorone/baton-sdk/pkg/types/resource"
 )
+
+var _ connectorbuilder.ResourceSyncer = (*userResourceType)(nil)
 
 type userResourceType struct {
 	resourceType *v2.ResourceType
