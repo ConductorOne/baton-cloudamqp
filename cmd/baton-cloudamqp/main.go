@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"os"
 
+	cfg "github.com/conductorone/baton-cloudamqp/pkg/config"
 	"github.com/conductorone/baton-cloudamqp/pkg/connector"
-	"github.com/conductorone/baton-sdk/pkg/cli"
+	"github.com/conductorone/baton-sdk/pkg/config"
 	"github.com/conductorone/baton-sdk/pkg/connectorbuilder"
+	"github.com/conductorone/baton-sdk/pkg/connectorrunner"
 	"github.com/conductorone/baton-sdk/pkg/types"
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
 	"go.uber.org/zap"
@@ -18,15 +20,19 @@ var version = "dev"
 func main() {
 	ctx := context.Background()
 
-	cfg := &config{}
-	cmd, err := cli.NewCmd(ctx, "baton-cloudamqp", cfg, validateConfig, getConnector)
+	_, cmd, err := config.DefineConfiguration(
+		ctx,
+		"baton-cloudamqp",
+		getConnector,
+		cfg.Config,
+		connectorrunner.WithDefaultCapabilitiesConnectorBuilder(&connector.CloudAMQP{}),
+	)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
 	}
 
 	cmd.Version = version
-	cmdFlags(cmd)
 
 	err = cmd.Execute()
 	if err != nil {
@@ -35,20 +41,20 @@ func main() {
 	}
 }
 
-func getConnector(ctx context.Context, cfg *config) (types.ConnectorServer, error) {
+func getConnector(ctx context.Context, c *cfg.Cloudamqp) (types.ConnectorServer, error) {
 	l := ctxzap.Extract(ctx)
 
-	cloudamqpConnector, err := connector.New(ctx, cfg.AccessToken)
+	cloudamqpConnector, err := connector.New(ctx, c.Token)
 	if err != nil {
 		l.Error("error creating connector", zap.Error(err))
 		return nil, err
 	}
 
-	connector, err := connectorbuilder.NewConnector(ctx, cloudamqpConnector)
+	conn, err := connectorbuilder.NewConnector(ctx, cloudamqpConnector)
 	if err != nil {
 		l.Error("error creating connector", zap.Error(err))
 		return nil, err
 	}
 
-	return connector, nil
+	return conn, nil
 }

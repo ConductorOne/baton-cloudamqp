@@ -7,6 +7,7 @@ import (
 	"github.com/conductorone/baton-cloudamqp/pkg/cloudamqp"
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
 	"github.com/conductorone/baton-sdk/pkg/annotations"
+	"github.com/conductorone/baton-sdk/pkg/connectorbuilder"
 	"github.com/conductorone/baton-sdk/pkg/pagination"
 	ent "github.com/conductorone/baton-sdk/pkg/types/entitlement"
 	"github.com/conductorone/baton-sdk/pkg/types/grant"
@@ -14,6 +15,8 @@ import (
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
 	"go.uber.org/zap"
 )
+
+var _ connectorbuilder.ResourceProvisioner = (*roleResourceType)(nil)
 
 const (
 	roleAdmin             = "admin"
