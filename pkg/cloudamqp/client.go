@@ -13,22 +13,33 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const BaseURL = "https://customer.cloudamqp.com/api"
-const UsersBaseURL = BaseURL + "/team"
-const UserBaseURL = BaseURL + "/team/%s"
+const DefaultBaseURL = "https://customer.cloudamqp.com/api"
 
 type Client struct {
 	httpClient *http.Client
 	Password   string
+	baseURL    string
 }
 
 type UsersResponse = []User
 
-func NewClient(httpClient *http.Client, password string) *Client {
+func NewClient(httpClient *http.Client, password string, baseURL string) *Client {
+	if baseURL == "" {
+		baseURL = DefaultBaseURL
+	}
 	return &Client{
 		httpClient: httpClient,
 		Password:   password,
+		baseURL:    baseURL,
 	}
+}
+
+func (c *Client) usersBaseURL() string {
+	return c.baseURL + "/team"
+}
+
+func (c *Client) userBaseURL() string {
+	return c.baseURL + "/team/%s"
 }
 
 // GetUsers returns all users under the team account.
@@ -37,7 +48,7 @@ func (c *Client) GetUsers(ctx context.Context) ([]User, error) {
 
 	err := c.get(
 		ctx,
-		UsersBaseURL,
+		c.usersBaseURL(),
 		&usersResponse,
 	)
 
@@ -60,7 +71,7 @@ func NewUpdateUserRolePayload(role string) url.Values {
 func (c *Client) UpdateUserRole(ctx context.Context, userId string, role string) error {
 	err := c.put(
 		ctx,
-		fmt.Sprintf(UserBaseURL, userId),
+		fmt.Sprintf(c.userBaseURL(), userId),
 		NewUpdateUserRolePayload(role),
 		nil,
 	)
