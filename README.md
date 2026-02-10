@@ -1,6 +1,6 @@
 ![Baton Logo](./docs/images/baton-logo.png)
 
-# `baton-cloudamqp` [![Go Reference](https://pkg.go.dev/badge/github.com/conductorone/baton-cloudamqp.svg)](https://pkg.go.dev/github.com/conductorone/baton-cloudamqp) ![main ci](https://github.com/conductorone/baton-cloudamqp/actions/workflows/main.yaml/badge.svg)
+# `baton-cloudamqp` [![Go Reference](https://pkg.go.dev/badge/github.com/conductorone/baton-cloudamqp.svg)](https://pkg.go.dev/github.com/conductorone/baton-cloudamqp) ![verify](https://github.com/conductorone/baton-cloudamqp/actions/workflows/verify.yaml/badge.svg)
 
 `baton-cloudamqp` is a connector for CloudAMQP built using the [Baton SDK](https://github.com/conductorone/baton-sdk). It communicates with the CloudAMQP Customer API to sync data about users and their roles.
 
@@ -8,7 +8,7 @@ Check out [Baton](https://github.com/conductorone/baton) to learn more about the
 
 # Prerequisites
 
-To work with the connector, you need to obtain API access token from CloudAMQP. 
+To work with the connector, you need to obtain API access token from CloudAMQP.
 
 Create token by going to the top menu bar, selecting the dropdown under your team name  -> `Team Settings` and from there click on `API Access` item in left menu bar where you can create either full access keys (shared with other team admins) or Personal access keys.
 
