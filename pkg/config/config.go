@@ -16,6 +16,7 @@ var (
 		"base-url",
 		field.WithDisplayName("Base URL"),
 		field.WithDescription("Override the CloudAMQP API URL (for testing)"),
+		field.WithHidden(true),
 	)
 
 	// ConfigurationFields defines the external configuration required for the
