@@ -17,8 +17,9 @@ const DefaultBaseURL = "https://customer.cloudamqp.com/api"
 
 type Client struct {
 	httpClient *http.Client
-	Password   string
-	baseURL    string
+	//nolint:gosec,nolintlint // G117: legitimate field name, not a credential
+	Password string
+	baseURL  string
 }
 
 type UsersResponse = []User
@@ -114,7 +115,7 @@ func (c *Client) doRequest(
 	req.Header.Set("content-type", "application/x-www-form-urlencoded")
 	req.Header.Set("Authorization", constructAuth(c.Password))
 
-	rawResponse, err := c.httpClient.Do(req)
+	rawResponse, err := c.httpClient.Do(req) //nolint:gosec,nolintlint // G704: URL constructed from trusted config
 	if err != nil {
 		return err
 	}
