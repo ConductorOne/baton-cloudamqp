@@ -5,6 +5,7 @@ import "reflect"
 
 type Cloudamqp struct {
 	Token string `mapstructure:"token"`
+	BaseUrl string `mapstructure:"base-url"`
 }
 
 func (c *Cloudamqp) findFieldByTag(tagValue string) (any, bool) {

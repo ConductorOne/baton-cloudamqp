@@ -61,13 +61,13 @@ func (pd *CloudAMQP) Validate(ctx context.Context) (annotations.Annotations, err
 }
 
 // New returns the CloudAMQP connector.
-func New(ctx context.Context, password string) (*CloudAMQP, error) {
+func New(ctx context.Context, password string, baseURL string) (*CloudAMQP, error) {
 	httpClient, err := uhttp.NewClient(ctx, uhttp.WithLogger(true, ctxzap.Extract(ctx)))
 	if err != nil {
 		return nil, err
 	}
 
 	return &CloudAMQP{
-		client: cloudamqp.NewClient(httpClient, password),
+		client: cloudamqp.NewClient(httpClient, password, baseURL),
 	}, nil
 }

@@ -44,7 +44,7 @@ func main() {
 func getConnector(ctx context.Context, c *cfg.Cloudamqp) (types.ConnectorServer, error) {
 	l := ctxzap.Extract(ctx)
 
-	cloudamqpConnector, err := connector.New(ctx, c.Token)
+	cloudamqpConnector, err := connector.New(ctx, c.Token, c.BaseUrl)
 	if err != nil {
 		l.Error("error creating connector", zap.Error(err))
 		return nil, err
