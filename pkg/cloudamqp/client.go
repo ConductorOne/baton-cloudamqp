@@ -43,6 +43,14 @@ func (c *Client) userBaseURL() string {
 	return c.baseURL + "/team/%s"
 }
 
+func (c *Client) teamInviteURL() string {
+	return c.baseURL + "/team/invite"
+}
+
+func (c *Client) teamRemoveURL() string {
+	return c.baseURL + "/team/remove"
+}
+
 // GetUsers returns all users under the team account.
 func (c *Client) GetUsers(ctx context.Context) ([]User, error) {
 	var usersResponse UsersResponse
@@ -58,6 +66,84 @@ func (c *Client) GetUsers(ctx context.Context) ([]User, error) {
 	}
 
 	return usersResponse, nil
+}
+
+// GetUserByEmail returns the team member with the given email, or a NotFound
+// status error if no member matches. CloudAMQP has no per-user lookup endpoint,
+// so this filters the full team list.
+func (c *Client) GetUserByEmail(ctx context.Context, email string) (*User, error) {
+	users, err := c.GetUsers(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range users {
+		if strings.EqualFold(users[i].Email, email) {
+			return &users[i], nil
+		}
+	}
+
+	return nil, status.Errorf(codes.NotFound, "cloudamqp: no team member with email %s", email)
+}
+
+// GetUserByID returns the team member with the given id, or a NotFound status
+// error if no member matches.
+func (c *Client) GetUserByID(ctx context.Context, id string) (*User, error) {
+	users, err := c.GetUsers(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range users {
+		if users[i].Id == id {
+			return &users[i], nil
+		}
+	}
+
+	return nil, status.Errorf(codes.NotFound, "cloudamqp: no team member with id %s", id)
+}
+
+func NewInviteUserPayload(email string, role string, tags string) url.Values {
+	payload := url.Values{}
+
+	payload.Set("email", email)
+	payload.Set("role", role)
+	if tags != "" {
+		payload.Set("tags", tags)
+	}
+
+	return payload
+}
+
+// InviteUser invites a new team member by email with the given role and
+// optional comma-separated instance tags. The invitee must accept the emailed
+// invitation before they appear as a team member.
+func (c *Client) InviteUser(ctx context.Context, email string, role string, tags string) error {
+	return c.post(
+		ctx,
+		c.teamInviteURL(),
+		NewInviteUserPayload(email, role, tags),
+		nil,
+	)
+}
+
+func NewRemoveUserPayload(email string) url.Values {
+	payload := url.Values{}
+
+	payload.Set("email", email)
+
+	return payload
+}
+
+// RemoveUser removes a team member by email. CloudAMQP uses POST /team/remove
+// (not an HTTP DELETE) and has no soft-disable, so this is a hard removal.
+func (c *Client) RemoveUser(ctx context.Context, email string) error {
+	return c.post(
+		ctx,
+		c.teamRemoveURL(),
+		NewRemoveUserPayload(email),
+		nil,
+	)
 }
 
 func NewUpdateUserRolePayload(role string) url.Values {
@@ -92,6 +178,10 @@ func (c *Client) put(ctx context.Context, urlAddress string, data url.Values, re
 	return c.doRequest(ctx, urlAddress, http.MethodPut, data, resourceResponse)
 }
 
+func (c *Client) post(ctx context.Context, urlAddress string, data url.Values, resourceResponse interface{}) error {
+	return c.doRequest(ctx, urlAddress, http.MethodPost, data, resourceResponse)
+}
+
 func (c *Client) doRequest(
 	ctx context.Context,
 	urlAddress string,
@@ -124,6 +214,12 @@ func (c *Client) doRequest(
 
 	if rawResponse.StatusCode >= 300 {
 		return status.Error(codes.Code(uint32(rawResponse.StatusCode)), "Request failed") //nolint:gosec // StatusCode is always valid HTTP code
+	}
+
+	// Provisioning calls (invite/remove/update-role) pass a nil response target
+	// and may return an empty body on success — skip decoding in that case.
+	if resourceResponse == nil {
+		return nil
 	}
 
 	if err := json.NewDecoder(rawResponse.Body).Decode(&resourceResponse); err != nil {
