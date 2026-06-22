@@ -23,15 +23,15 @@ func IsNotFoundError(err error) bool {
 	}
 }
 
-// IsAlreadyExistsError reports whether err represents an HTTP response that
-// CloudAMQP returns when the team member or invitation already exists. CloudAMQP
-// is not consistent here, so both 409 Conflict and 422 Unprocessable Entity are
-// treated as already-exists.
+// IsAlreadyExistsError reports whether err represents an HTTP 409 Conflict, which
+// CloudAMQP returns when the team member or invitation already exists. Only 409 is
+// treated as already-exists: a 422 Unprocessable Entity is a genuine validation
+// failure (e.g. a malformed email) and must surface as an error rather than be
+// masked as "already exists".
 func IsAlreadyExistsError(err error) bool {
 	switch status.Code(err) {
 	case codes.AlreadyExists,
-		codes.Code(http.StatusConflict),
-		codes.Code(http.StatusUnprocessableEntity):
+		codes.Code(http.StatusConflict):
 		return true
 	default:
 		return false
