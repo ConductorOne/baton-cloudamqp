@@ -7,19 +7,21 @@
 // Point the connector at it with: --base-url http://localhost:8080/api
 // (or BATON_BASE_URL). Any non-empty Basic auth is accepted.
 //
-// Invite semantics mirror the real API (and the baton-workato mock it was modeled
-// on): POST /team/invite is ASYNC — the invitee only becomes a team member after
-// accepting the emailed invitation, so an invited address does NOT appear in
-// /team. This exercises the connector's pending-invite (ActionRequiredResult)
-// path. A duplicate invite (already a member, or already invited) returns 409
-// Conflict, which the connector classifies as already-exists. Delete/role-update
-// operate on the seeded members.
+// Invite semantics: the real CloudAMQP API only materializes a team member once
+// the invitee accepts the emailed invitation. To make the full
+// create -> find -> delete lifecycle testable without a human in the loop (the
+// account-provisioning CI action creates an account and then resolves it by
+// email), this mock AUTO-ACCEPTS: POST /team/invite immediately adds the member
+// to /team with a generated id. A duplicate invite (already a member) returns
+// 409 Conflict, which the connector classifies as already-exists. That
+// auto-accept is the one intentional divergence from production.
 package main
 
 import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -28,6 +30,8 @@ import (
 	"time"
 )
 
+const maxFormBytes = 1 << 20
+
 type user struct {
 	Id    string   `json:"id"`
 	Email string   `json:"email"`
@@ -35,9 +39,9 @@ type user struct {
 }
 
 type store struct {
-	mu      sync.Mutex
-	users   []user
-	invited map[string]bool
+	mu     sync.Mutex
+	users  []user
+	nextID int
 }
 
 func newStore() *store {
@@ -46,7 +50,7 @@ func newStore() *store {
 			{Id: "1", Email: "owner@example.com", Roles: []string{"owner"}},
 			{Id: "2", Email: "dev@example.com", Roles: []string{"developer"}},
 		},
-		invited: map[string]bool{},
+		nextID: 3,
 	}
 }
 
@@ -68,30 +72,33 @@ func (s *store) findByEmail(email string) (int, bool) {
 	return 0, false
 }
 
-// invite records a pending invitation. The invitee does NOT become a member
-// until they accept (async), so this never adds to /team. Returns 409 if the
-// email is already a member or already invited — the connector's
+// invite auto-accepts: it immediately adds the invitee as a team member so the
+// account-provisioning lifecycle (create -> resolve-by-email -> delete) can run
+// end-to-end. Returns 409 if the email is already a member — the connector's
 // IsAlreadyExistsError path.
-func (s *store) invite(email string) int {
+func (s *store) invite(email, role string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.findByEmail(email); ok {
 		return http.StatusConflict
 	}
-	key := strings.ToLower(email)
-	if s.invited[key] {
-		return http.StatusConflict
+	if role == "" {
+		role = "member"
 	}
-	s.invited[key] = true
+	s.users = append(s.users, user{
+		Id:    fmt.Sprintf("%d", s.nextID),
+		Email: email,
+		Roles: []string{role},
+	})
+	s.nextID++
 	return http.StatusOK
 }
 
 // remove deletes a member by email. Returns 404 if no such member (the connector
-// treats not-found-on-delete as success). Also clears any pending invitation.
+// treats not-found-on-delete as success).
 func (s *store) remove(email string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.invited, strings.ToLower(email))
 	i, ok := s.findByEmail(email)
 	if !ok {
 		return http.StatusNotFound
@@ -118,6 +125,12 @@ func requireAuth(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	return true
+}
+
+// parseForm bounds the request body before parsing (gosec G120).
+func parseForm(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxFormBytes)
+	_ = r.ParseForm()
 }
 
 func newMux(s *store) *http.ServeMux {
@@ -150,8 +163,8 @@ func newMux(s *store) *http.ServeMux {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		_ = r.ParseForm()
-		if code := s.invite(r.PostForm.Get("email")); code != http.StatusOK {
+		parseForm(w, r)
+		if code := s.invite(r.PostForm.Get("email"), r.PostForm.Get("role")); code != http.StatusOK {
 			http.Error(w, "invite failed", code)
 		}
 	})
@@ -164,7 +177,7 @@ func newMux(s *store) *http.ServeMux {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		_ = r.ParseForm()
+		parseForm(w, r)
 		if code := s.remove(r.PostForm.Get("email")); code != http.StatusOK {
 			http.Error(w, "remove failed", code)
 		}
@@ -186,7 +199,7 @@ func newMux(s *store) *http.ServeMux {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		_ = r.ParseForm()
+		parseForm(w, r)
 		if code := s.updateRole(id, r.PostForm.Get("role")); code != http.StatusOK {
 			http.Error(w, "update failed", code)
 		}
