@@ -103,47 +103,26 @@ func (c *Client) GetUserByID(ctx context.Context, id string) (*User, error) {
 	return nil, status.Errorf(codes.NotFound, "cloudamqp: no team member with id %s", id)
 }
 
-func NewInviteUserPayload(email string, role string, tags string) url.Values {
+// InviteUser invites a new team member by email with the given role and
+// optional instance tags. Each tag is sent as a separate form field so the
+// server receives an array (e.g. tags[]=prod&tags[]=staging). The invitee must
+// accept the emailed invitation before they appear as a team member.
+func (c *Client) InviteUser(ctx context.Context, email string, role string, tags []string) error {
 	payload := url.Values{}
-
 	payload.Set("email", email)
 	payload.Set("role", role)
-	if tags != "" {
-		payload.Set("tags", tags)
+	for _, t := range tags {
+		payload.Add("tags[]", t)
 	}
-
-	return payload
-}
-
-// InviteUser invites a new team member by email with the given role and
-// optional comma-separated instance tags. The invitee must accept the emailed
-// invitation before they appear as a team member.
-func (c *Client) InviteUser(ctx context.Context, email string, role string, tags string) error {
-	return c.post(
-		ctx,
-		c.teamInviteURL(),
-		NewInviteUserPayload(email, role, tags),
-		nil,
-	)
-}
-
-func NewRemoveUserPayload(email string) url.Values {
-	payload := url.Values{}
-
-	payload.Set("email", email)
-
-	return payload
+	return c.post(ctx, c.teamInviteURL(), payload, nil)
 }
 
 // RemoveUser removes a team member by email. CloudAMQP uses POST /team/remove
 // (not an HTTP DELETE) and has no soft-disable, so this is a hard removal.
 func (c *Client) RemoveUser(ctx context.Context, email string) error {
-	return c.post(
-		ctx,
-		c.teamRemoveURL(),
-		NewRemoveUserPayload(email),
-		nil,
-	)
+	payload := url.Values{}
+	payload.Set("email", email)
+	return c.post(ctx, c.teamRemoveURL(), payload, nil)
 }
 
 func NewUpdateUserRolePayload(role string) url.Values {

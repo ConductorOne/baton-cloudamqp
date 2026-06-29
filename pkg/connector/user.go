@@ -151,8 +151,16 @@ func (u *userResourceType) CreateAccount(
 		return nil, nil, nil, fmt.Errorf("cloudamqp-connector: create account: unknown role %q (valid: %v)", role, knownInviteRoles)
 	}
 
-	tags, _ := profileMap["tags"].(string)
-	tags = strings.TrimSpace(tags)
+	tagsRaw, _ := profileMap["tags"].([]interface{})
+	var tags []string
+	for _, t := range tagsRaw {
+		if s, ok := t.(string); ok {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				tags = append(tags, s)
+			}
+		}
+	}
 
 	// Step 1: short-circuit if the member already exists in this team.
 	if existing, err := u.client.GetUserByEmail(ctx, email); err == nil {
@@ -178,6 +186,8 @@ func (u *userResourceType) CreateAccount(
 				return nil, nil, nil, resErr
 			}
 			return &v2.CreateAccountResponse_AlreadyExistsResult{Resource: res}, nil, nil, nil
+		} else if !cloudamqp.IsNotFoundError(ferr) {
+			return nil, nil, nil, fmt.Errorf("cloudamqp-connector: create account: failed to re-resolve member %s after 409: %w", email, ferr)
 		}
 		return &v2.CreateAccountResponse_ActionRequiredResult{
 			Message:               fmt.Sprintf("Invitation already pending for %s. The user must accept the email invitation to complete account creation.", email),

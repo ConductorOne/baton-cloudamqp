@@ -127,10 +127,15 @@ func requireAuth(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
-// parseForm bounds the request body before parsing (gosec G120).
-func parseForm(w http.ResponseWriter, r *http.Request) {
+// parseForm bounds the request body before parsing (gosec G120) and returns
+// false (after writing a 400) if the body exceeds maxFormBytes or is malformed.
+func parseForm(w http.ResponseWriter, r *http.Request) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxFormBytes)
-	_ = r.ParseForm()
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return false
+	}
+	return true
 }
 
 func newMux(s *store) *http.ServeMux {
@@ -163,7 +168,9 @@ func newMux(s *store) *http.ServeMux {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		parseForm(w, r)
+		if !parseForm(w, r) {
+			return
+		}
 		if code := s.invite(r.PostForm.Get("email"), r.PostForm.Get("role")); code != http.StatusOK {
 			http.Error(w, "invite failed", code)
 		}
@@ -177,7 +184,9 @@ func newMux(s *store) *http.ServeMux {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		parseForm(w, r)
+		if !parseForm(w, r) {
+			return
+		}
 		if code := s.remove(r.PostForm.Get("email")); code != http.StatusOK {
 			http.Error(w, "remove failed", code)
 		}
@@ -199,7 +208,9 @@ func newMux(s *store) *http.ServeMux {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		parseForm(w, r)
+		if !parseForm(w, r) {
+			return
+		}
 		if code := s.updateRole(id, r.PostForm.Get("role")); code != http.StatusOK {
 			http.Error(w, "update failed", code)
 		}

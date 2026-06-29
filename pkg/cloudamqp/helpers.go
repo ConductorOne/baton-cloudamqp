@@ -29,11 +29,5 @@ func IsNotFoundError(err error) bool {
 // failure (e.g. a malformed email) and must surface as an error rather than be
 // masked as "already exists".
 func IsAlreadyExistsError(err error) bool {
-	switch status.Code(err) {
-	case codes.AlreadyExists,
-		codes.Code(http.StatusConflict):
-		return true
-	default:
-		return false
-	}
+	return status.Code(err) == codes.Code(http.StatusConflict)
 }

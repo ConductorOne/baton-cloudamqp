@@ -71,12 +71,11 @@ func (pd *CloudAMQP) Metadata(ctx context.Context) (*v2.ConnectorMetadata, error
 				"tags": {
 					DisplayName: "Tags",
 					Required:    false,
-					Description: "Optional comma-separated instance tags scoping a member's access.",
-					Field: &v2.ConnectorAccountCreationSchema_Field_StringField{
-						StringField: &v2.ConnectorAccountCreationSchema_StringField{},
+					Description: "Instance tags scoping a member's access.",
+					Field: &v2.ConnectorAccountCreationSchema_Field_StringListField{
+						StringListField: &v2.ConnectorAccountCreationSchema_StringListField{},
 					},
-					Placeholder: "prod,staging",
-					Order:       3,
+					Order: 3,
 				},
 			},
 		},
