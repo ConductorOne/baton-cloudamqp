@@ -13,6 +13,8 @@ import (
 	"github.com/conductorone/baton-sdk/pkg/types/resource"
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
 	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
@@ -75,7 +77,7 @@ func userResource(ctx context.Context, user *cloudamqp.User) (*v2.Resource, erro
 func (u *userResourceType) List(ctx context.Context, parentID *v2.ResourceId, pt *pagination.Token) ([]*v2.Resource, string, annotations.Annotations, error) {
 	users, err := u.client.GetUsers(ctx)
 	if err != nil {
-		return nil, "", nil, fmt.Errorf("cloudamqp-connector: failed to list users: %w", err)
+		return nil, "", nil, fmt.Errorf("baton-cloudamqp: failed to list users: %w", err)
 	}
 
 	rv := make([]*v2.Resource, 0, len(users))
@@ -139,7 +141,7 @@ func (u *userResourceType) CreateAccount(
 	}
 	email = strings.TrimSpace(email)
 	if email == "" {
-		return nil, nil, nil, fmt.Errorf("cloudamqp-connector: create account: email is required")
+		return nil, nil, nil, status.Errorf(codes.InvalidArgument, "baton-cloudamqp: create account: email is required")
 	}
 
 	role, _ := profileMap["role"].(string)
@@ -148,7 +150,7 @@ func (u *userResourceType) CreateAccount(
 		role = defaultInviteRole
 	}
 	if !isKnownInviteRole(role) {
-		return nil, nil, nil, fmt.Errorf("cloudamqp-connector: create account: unknown role %q (valid: %v)", role, knownInviteRoles)
+		return nil, nil, nil, status.Errorf(codes.InvalidArgument, "baton-cloudamqp: create account: unknown role %q (valid: %v)", role, knownInviteRoles)
 	}
 
 	tagsRaw, _ := profileMap["tags"].([]interface{})
@@ -168,16 +170,16 @@ func (u *userResourceType) CreateAccount(
 		if resErr != nil {
 			return nil, nil, nil, resErr
 		}
-		l.Debug("cloudamqp-connector: member already exists, returning AlreadyExistsResult", zap.String("email", email))
+		l.Debug("baton-cloudamqp: member already exists, returning AlreadyExistsResult", zap.String("email", email))
 		return &v2.CreateAccountResponse_AlreadyExistsResult{Resource: res}, nil, nil, nil
 	} else if !cloudamqp.IsNotFoundError(err) {
-		return nil, nil, nil, fmt.Errorf("cloudamqp-connector: create account: failed to look up member %s: %w", email, err)
+		return nil, nil, nil, fmt.Errorf("baton-cloudamqp: create account: failed to look up member %s: %w", email, err)
 	}
 
 	// Step 2: send the invitation.
 	if err := u.client.InviteUser(ctx, email, role, tags); err != nil {
 		if !cloudamqp.IsAlreadyExistsError(err) {
-			return nil, nil, nil, fmt.Errorf("cloudamqp-connector: create account: failed to invite %s: %w", email, err)
+			return nil, nil, nil, fmt.Errorf("baton-cloudamqp: create account: failed to invite %s: %w", email, err)
 		}
 		// Invite reported already-exists: re-resolve to decide member vs pending.
 		if existing, ferr := u.client.GetUserByEmail(ctx, email); ferr == nil {
@@ -187,7 +189,7 @@ func (u *userResourceType) CreateAccount(
 			}
 			return &v2.CreateAccountResponse_AlreadyExistsResult{Resource: res}, nil, nil, nil
 		} else if !cloudamqp.IsNotFoundError(ferr) {
-			return nil, nil, nil, fmt.Errorf("cloudamqp-connector: create account: failed to re-resolve member %s after 409: %w", email, ferr)
+			return nil, nil, nil, fmt.Errorf("baton-cloudamqp: create account: failed to re-resolve member %s after 409: %w", email, ferr)
 		}
 		return &v2.CreateAccountResponse_ActionRequiredResult{
 			Message:               fmt.Sprintf("Invitation already pending for %s. The user must accept the email invitation to complete account creation.", email),
@@ -213,14 +215,14 @@ func (u *userResourceType) Delete(ctx context.Context, resourceID *v2.ResourceId
 		if cloudamqp.IsNotFoundError(err) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("cloudamqp-connector: delete: failed to resolve member %s: %w", resourceID.Resource, err)
+		return nil, fmt.Errorf("baton-cloudamqp: delete: failed to resolve member %s: %w", resourceID.Resource, err)
 	}
 
 	if err := u.client.RemoveUser(ctx, user.Email); err != nil {
 		if cloudamqp.IsNotFoundError(err) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("cloudamqp-connector: delete: failed to remove member %s: %w", resourceID.Resource, err)
+		return nil, fmt.Errorf("baton-cloudamqp: delete: failed to remove member %s: %w", resourceID.Resource, err)
 	}
 
 	return nil, nil

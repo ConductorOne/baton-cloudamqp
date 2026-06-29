@@ -83,7 +83,7 @@ func (c *Client) GetUserByEmail(ctx context.Context, email string) (*User, error
 		}
 	}
 
-	return nil, status.Errorf(codes.NotFound, "cloudamqp: no team member with email %s", email)
+	return nil, status.Errorf(codes.NotFound, "baton-cloudamqp: no team member with email %s", email)
 }
 
 // GetUserByID returns the team member with the given id, or a NotFound status
@@ -100,7 +100,7 @@ func (c *Client) GetUserByID(ctx context.Context, id string) (*User, error) {
 		}
 	}
 
-	return nil, status.Errorf(codes.NotFound, "cloudamqp: no team member with id %s", id)
+	return nil, status.Errorf(codes.NotFound, "baton-cloudamqp: no team member with id %s", id)
 }
 
 // InviteUser invites a new team member by email with the given role and
