@@ -46,6 +46,39 @@ func (pd *CloudAMQP) ResourceSyncers(ctx context.Context) []connectorbuilder.Res
 func (pd *CloudAMQP) Metadata(ctx context.Context) (*v2.ConnectorMetadata, error) {
 	return &v2.ConnectorMetadata{
 		DisplayName: "CloudAMQP",
+		AccountCreationSchema: &v2.ConnectorAccountCreationSchema{
+			FieldMap: map[string]*v2.ConnectorAccountCreationSchema_Field{
+				"email": {
+					DisplayName: "Email",
+					Required:    true,
+					Description: "Email address of the team member to invite.",
+					Field: &v2.ConnectorAccountCreationSchema_Field_StringField{
+						StringField: &v2.ConnectorAccountCreationSchema_StringField{},
+					},
+					Placeholder: "jane.doe@example.com",
+					Order:       1,
+				},
+				"role": {
+					DisplayName: "Role",
+					Required:    false,
+					Description: "Team role for the new member. One of: owner, admin, developer, devops, member. Defaults to member when omitted.",
+					Field: &v2.ConnectorAccountCreationSchema_Field_StringField{
+						StringField: &v2.ConnectorAccountCreationSchema_StringField{},
+					},
+					Placeholder: "member",
+					Order:       2,
+				},
+				"tags": {
+					DisplayName: "Tags",
+					Required:    false,
+					Description: "Instance tags scoping a member's access.",
+					Field: &v2.ConnectorAccountCreationSchema_Field_StringListField{
+						StringListField: &v2.ConnectorAccountCreationSchema_StringListField{},
+					},
+					Order: 3,
+				},
+			},
+		},
 	}, nil
 }
 

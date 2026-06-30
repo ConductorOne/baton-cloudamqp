@@ -5,26 +5,33 @@ on:
   push:
     branches:
       - main
+env:
+  BATON_LOG_LEVEL: debug
+  # Credentials + endpoint for the in-process mock (cmd/test-server). No real
+  # CloudAMQP tenant is involved; the mock accepts any Basic auth.
+  BATON_TOKEN: test-token
+  BATON_BASE_URL: http://localhost:8080/api
 jobs:
-  test:
-    if: false  # Remove this line to enable integration tests
+  account-provisioning-test:
+    # Exercises sync + the account-provisioning lifecycle (CreateAccount/invite ->
+    # the mock auto-accepts so the member is real -> Delete) against the in-process
+    # CloudAMQP mock in cmd/test-server, so it needs no real tenant credentials.
     runs-on: ubuntu-latest
     steps:
-      - name: Install Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
       - name: Checkout code
-        uses: actions/checkout@v6
-      # Build the connector binary, then run sync-test.
-      # Configure with valid entitlement/principal IDs.
-      # Add additional test jobs as needed.
-      - name: Build baton-cloudamqp
-        run: go build ./cmd/baton-cloudamqp
-      - name: Test connector syncing
-        uses: ConductorOne/github-workflows/actions/sync-test@v4
+        uses: actions/checkout@v4
+      - uses: ./.github/actions/start-test-server
+      - name: Run sync
+        run: ./baton-cloudamqp
+      - name: Account provisioning (create/delete)
+        uses: ConductorOne/github-workflows/actions/account-provisioning@v4
         with:
           connector: ./baton-cloudamqp
-          baton-entitlement: '<entitlement-id>'
-          baton-principal: '<principal-id>'
-          baton-principal-type: 'user'
+          account-email: newhire@example.com
+          account-login: newhire@example.com
+          account-profile: '{"email":"newhire@example.com","role":"member"}'
+          account-type: user
+          search-method: email
+      - name: Stop test server
+        if: always()
+        run: pkill -f test-server || true
