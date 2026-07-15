@@ -16,16 +16,16 @@ else
 	BUILD_TAGS=
 endif
 
+.PHONY: build
+build: $(GENERATED_CONF)
+	go build ${BUILD_TAGS} -o ${OUTPUT_PATH} ./cmd/baton-cloudamqp
+
 $(GENERATED_CONF): pkg/config/config.go go.mod
 	@echo "Generating $(GENERATED_CONF)..."
 	go generate ./pkg/config
 
 .PHONY: generate
 generate: $(GENERATED_CONF)
-
-.PHONY: build
-build: $(GENERATED_CONF)
-	go build ${BUILD_TAGS} -o ${OUTPUT_PATH} ./cmd/baton-cloudamqp
 
 .PHONY: update-deps
 update-deps:
