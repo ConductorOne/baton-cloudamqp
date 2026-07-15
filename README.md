@@ -44,9 +44,17 @@ baton resources
 
 `baton-cloudamqp` will pull down information about the following CloudAMQP resources:
 
-- Users
+- Users (team members)
+- Roles
 
-By default, `baton-cloudamqp` will sync information only from account based on provided credential.
+By default, `baton-cloudamqp` will sync information only from the account based on the provided credential.
+
+## Provisioning
+
+`baton-cloudamqp` supports provisioning against CloudAMQP team membership (requires a Team plan or higher):
+
+- **Account provisioning** — invite a team member (`POST /team/invite`) and remove a team member (`POST /team/remove`). Invitations are email-based; a new member is materialized once they accept the emailed invitation.
+- **Role provisioning** — grant a role to a member and revoke it (`PUT /team/{id}`). A member always holds a role, so revoking a role downgrades the member to `member` rather than removing them.
 
 # Contributing, Support and Issues
 
