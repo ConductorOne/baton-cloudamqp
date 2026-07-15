@@ -104,5 +104,8 @@
         }
       }
     }
-  ]
+  ],
+  "displayName": "CloudAMQP",
+  "helpUrl": "/docs/baton/cloudamqp",
+  "iconUrl": "/static/app-icons/cloudamqp.svg"
 }
