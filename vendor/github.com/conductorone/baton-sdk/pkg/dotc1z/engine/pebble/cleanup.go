@@ -35,6 +35,8 @@ func scopedRanges() [][2][]byte {
 		{GrantByPrincipalLowerBound(), GrantByPrincipalUpperBound()},
 		{GrantByPrincipalResourceTypeLowerBound(), GrantByPrincipalResourceTypeUpperBound()},
 		{GrantByNeedsExpansionLowerBound(), GrantByNeedsExpansionUpperBound()},
+		{GrantByEntPrincHashLowerBound(), GrantByEntPrincHashUpperBound()},
+		{DigestLowerBound(), DigestUpperBound()},
 		{encodeAssetPrefix(), upperBoundOf(encodeAssetPrefix())},
 		// Stats sidecar — single key; the half-open range shape
 		// contains exactly that one key.
@@ -90,8 +92,21 @@ func (e *Engine) ResetForNewSync(ctx context.Context) error {
 	// engine stays sealed until MarkFreshSync unseals it right after.
 	return e.withWriteAllowSealed(func() error {
 		for _, span := range spans {
-			if err := e.db.Excise(ctx, span); err != nil {
+			if err := e.db.ExciseRange(ctx, span); err != nil {
 				return fmt.Errorf("ResetForNewSync: excise [%x, %x): %w", span.Start, span.End, err)
+			}
+		}
+		// The record-type span above covers typeDigest and the hash
+		// index too; disarm the mutation-path digest invalidation.
+		e.db.SetGrantDigestsPresent(false)
+		// The digest-build crash marker lives in the preserved
+		// engine-meta range, but the excise just removed everything it
+		// was guarding against trusting — consume it (only reachable
+		// when an interrupted build's cleanup drop itself failed;
+		// writable Opens consume it before anything else runs).
+		if e.grantDigestBuildPending.Load() {
+			if err := e.clearGrantDigestBuildPending(); err != nil {
+				return err
 			}
 		}
 		e.noteEntitlementKeyspaceWrite()
@@ -191,10 +206,10 @@ func (e *Engine) Flush(ctx context.Context) error {
 	if e.closing.Load() {
 		return ErrEngineClosing
 	}
-	if err := e.db.Flush(); err != nil {
+	if err := e.db.FlushMemtables(); err != nil {
 		return fmt.Errorf("engine: flush: %w", err)
 	}
-	if err := e.db.LogData(nil, pebble.Sync); err != nil {
+	if err := e.db.WALSyncPoint(); err != nil {
 		return fmt.Errorf("engine: fsync WAL: %w", err)
 	}
 	return nil

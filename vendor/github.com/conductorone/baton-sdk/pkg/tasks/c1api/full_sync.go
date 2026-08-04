@@ -33,12 +33,27 @@ type fullSyncHelpers interface {
 	TempDir() string
 }
 
+// classifySyncError applies the task-manager retry policy to a failed
+// sync's error. Ingestion-invariant DATA VERDICTS are deterministic on
+// the connector's dataset: retrying re-fails identically, so they are
+// marked non-retryable. The pass's IO failures don't carry the sentinel
+// and stay retryable. Kept as a standalone function so the mapping is
+// testable at this layer (the manager consumes ErrTaskNonRetryable via
+// errors.Is when finishing the task).
+func classifySyncError(err error) error {
+	if errors.Is(err, sdkSync.ErrIngestInvariantViolated) {
+		err = errors.Join(err, ErrTaskNonRetryable)
+	}
+	return err
+}
+
 type fullSyncTaskHandler struct {
 	task                                *v1.Task
 	helpers                             fullSyncHelpers
 	skipFullSync                        bool
 	externalResourceC1ZPath             string
 	externalResourceEntitlementIdFilter string
+	externalResourceTraits              []v2.ResourceType_Trait
 	targetedSyncResources               []*v2.Resource
 	syncResourceTypeIDs                 []string
 	workerCount                         int
@@ -188,6 +203,10 @@ func (c *fullSyncTaskHandler) sync(ctx context.Context, c1zPath string) error {
 		syncOpts = append(syncOpts, sdkSync.WithExternalResourceC1ZPath(c.externalResourceC1ZPath))
 	}
 
+	if len(c.externalResourceTraits) > 0 {
+		syncOpts = append(syncOpts, sdkSync.WithExternalResourceTraits(c.externalResourceTraits...))
+	}
+
 	// ETag replay (opt-in): feed the spare retained from the last
 	// successful upload as the previous-sync replay source. Optional
 	// semantics — a missing/corrupt/stale-format spare degrades to a
@@ -308,7 +327,7 @@ func (c *fullSyncTaskHandler) HandleTask(ctx context.Context) error {
 		if removeErr := os.Remove(c1zPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 			l.Error("failed to remove temp file after sync failure", zap.Error(removeErr), zap.String("path", c1zPath))
 		}
-		return c.helpers.FinishTask(ctx, nil, nil, err)
+		return c.helpers.FinishTask(ctx, nil, nil, classifySyncError(err))
 	}
 
 	c1zF, err := os.Open(c1zPath)
@@ -356,6 +375,7 @@ func newFullSyncTaskHandler(
 	skipFullSync bool,
 	externalResourceC1ZPath string,
 	externalResourceEntitlementIdFilter string,
+	externalResourceTraits []v2.ResourceType_Trait,
 	targetedSyncResources []*v2.Resource,
 	syncResourceTypeIDs []string,
 	workerCount int,
@@ -368,6 +388,7 @@ func newFullSyncTaskHandler(
 		skipFullSync:                        skipFullSync,
 		externalResourceC1ZPath:             externalResourceC1ZPath,
 		externalResourceEntitlementIdFilter: externalResourceEntitlementIdFilter,
+		externalResourceTraits:              externalResourceTraits,
 		targetedSyncResources:               targetedSyncResources,
 		syncResourceTypeIDs:                 syncResourceTypeIDs,
 		workerCount:                         workerCount,

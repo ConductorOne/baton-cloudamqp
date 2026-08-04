@@ -7,6 +7,7 @@ import (
 	"sort"
 
 	"github.com/cockroachdb/pebble/v2"
+	reader_v2 "github.com/conductorone/baton-sdk/pb/c1/reader/v2"
 	v3 "github.com/conductorone/baton-sdk/pb/c1/storage/v3"
 	"github.com/conductorone/baton-sdk/pkg/connectorstore"
 	"github.com/conductorone/baton-sdk/pkg/dotc1z/c1zstore"
@@ -17,13 +18,15 @@ import (
 // records live in Pebble under typeSyncRun; methods here walk
 // IterateAllSyncRuns + GetSyncRunRecord + PutSyncRunRecord on the
 // engine.
-func (a *Adapter) SyncMeta() c1zstore.SyncMeta {
-	return pebbleSyncMeta{a: a}
+func (e *Engine) SyncMeta() c1zstore.SyncMeta {
+	return pebbleSyncMeta{e: e}
 }
 
 type pebbleSyncMeta struct {
-	a *Adapter
+	e *Engine
 }
+
+var _ c1zstore.IngestInvariantVerificationWriter = pebbleSyncMeta{}
 
 // MarkSyncSupportsDiff sets supports_diff = true on the named sync's
 // run record. Used by pkg/sync.parallelSyncer after graph
@@ -39,13 +42,62 @@ func (s pebbleSyncMeta) MarkSyncSupportsDiff(ctx context.Context, syncID string)
 	if syncID == "" {
 		return errors.New("MarkSyncSupportsDiff: empty syncID")
 	}
-	r, err := s.a.engine.GetSyncRunRecord(ctx, syncID)
+	r, err := s.e.GetSyncRunRecord(ctx, syncID)
 	if err != nil {
 		return c1zstore.AdaptNotFound(fmt.Errorf("MarkSyncSupportsDiff: get: %w", err), pebble.ErrNotFound)
 	}
 	r.SetSupportsDiff(true)
-	if err := s.a.engine.PutSyncRunRecord(ctx, r); err != nil {
+	if err := s.e.PutSyncRunRecord(ctx, r); err != nil {
 		return fmt.Errorf("MarkSyncSupportsDiff: put: %w", err)
+	}
+	return nil
+}
+
+// MarkIngestInvariantsVerified persists the successful invariant pass on the
+// sync-run record. Rewriting the same marker after crash/resume is idempotent.
+func (s pebbleSyncMeta) MarkIngestInvariantsVerified(
+	ctx context.Context,
+	syncID string,
+	verification c1zstore.IngestInvariantVerification,
+) error {
+	if syncID == "" {
+		return errors.New("MarkIngestInvariantsVerified: empty syncID")
+	}
+	if !verification.IsVerified() {
+		return errors.New("MarkIngestInvariantsVerified: incomplete verification")
+	}
+	r, err := s.e.GetSyncRunRecord(ctx, syncID)
+	if err != nil {
+		return c1zstore.AdaptNotFound(fmt.Errorf("MarkIngestInvariantsVerified: get: %w", err), pebble.ErrNotFound)
+	}
+	// The marker is only ever valid on a sealed sync: an unfinished sync's
+	// data is still mutable, so a verified-but-unfinished record would be a
+	// lie the moment the next write lands. Callers mark AFTER EndSync.
+	if r.GetEndedAt() == nil {
+		return fmt.Errorf("MarkIngestInvariantsVerified: sync %s is not finished", syncID)
+	}
+	r.SetIngestInvariantGeneration(verification.Generation)
+	r.SetIngestInvariantCoverage(append([]string(nil), verification.Coverage...))
+	r.SetIngestInvariantMode(string(verification.Mode))
+	if err := s.e.PutSyncRunRecord(ctx, r); err != nil {
+		return fmt.Errorf("MarkIngestInvariantsVerified: put: %w", err)
+	}
+	return nil
+}
+
+func (s pebbleSyncMeta) ClearIngestInvariantVerification(ctx context.Context, syncID string) error {
+	if syncID == "" {
+		return errors.New("ClearIngestInvariantVerification: empty syncID")
+	}
+	r, err := s.e.GetSyncRunRecord(ctx, syncID)
+	if err != nil {
+		return c1zstore.AdaptNotFound(fmt.Errorf("ClearIngestInvariantVerification: get: %w", err), pebble.ErrNotFound)
+	}
+	r.SetIngestInvariantGeneration("")
+	r.SetIngestInvariantCoverage(nil)
+	r.SetIngestInvariantMode("")
+	if err := s.e.PutSyncRunRecord(ctx, r); err != nil {
+		return fmt.Errorf("ClearIngestInvariantVerification: put: %w", err)
 	}
 	return nil
 }
@@ -69,7 +121,7 @@ func (s pebbleSyncMeta) LatestFinishedSyncOfAnyType(ctx context.Context) (*c1zst
 // translates the result into the exported c1zstore.SyncRun shape.
 // typeOK is passed through verbatim; nil matches any sync type.
 func (s pebbleSyncMeta) latestFinishedSync(ctx context.Context, typeOK func(v3.SyncType) bool) (*c1zstore.SyncRun, error) {
-	best, err := s.a.engine.LatestFinishedSyncRecord(ctx, typeOK)
+	best, err := s.e.LatestFinishedSyncRecord(ctx, typeOK)
 	if err != nil {
 		return nil, err
 	}
@@ -83,7 +135,12 @@ func (s pebbleSyncMeta) latestFinishedSync(ctx context.Context, typeOK func(v3.S
 // Delegates to Adapter.Stats, which reads the EndFreshSync stats
 // sidecar (O(1)) when present and falls back to iteration when not.
 func (s pebbleSyncMeta) Stats(ctx context.Context, syncType connectorstore.SyncType, syncID string) (map[string]int64, error) {
-	return s.a.Stats(ctx, syncType, syncID)
+	return s.e.Stats(ctx, syncType, syncID)
+}
+
+// StatsV2 implements SyncMeta. Signature matches *C1File.StatsV2 exactly.
+func (s pebbleSyncMeta) StatsV2(ctx context.Context, syncType connectorstore.SyncType, syncID string) (*reader_v2.SyncStats, error) {
+	return s.e.StatsV2(ctx, syncType, syncID)
 }
 
 // RecalculateStats recomputes the stats sidecar for syncID from the
@@ -93,12 +150,12 @@ func (s pebbleSyncMeta) Stats(ctx context.Context, syncType connectorstore.SyncT
 // sync is named.
 func (s pebbleSyncMeta) RecalculateStats(ctx context.Context, syncID string) error {
 	if syncID == "" {
-		syncID = s.a.currentSyncID()
+		syncID = s.e.CurrentSyncID()
 	}
 	if syncID == "" {
 		return errors.New("RecalculateStats: empty syncID and no current sync")
 	}
-	return s.a.engine.PersistSyncStats(ctx, syncID)
+	return s.e.PersistSyncStats(ctx, syncID)
 }
 
 // syncRunRecordToExported translates the Pebble v3.SyncRunRecord
@@ -108,13 +165,22 @@ func syncRunRecordToExported(r *v3.SyncRunRecord) *c1zstore.SyncRun {
 	if r == nil {
 		return nil
 	}
+	verification := c1zstore.IngestInvariantVerification{
+		Generation: r.GetIngestInvariantGeneration(),
+		Coverage:   append([]string(nil), r.GetIngestInvariantCoverage()...),
+		Mode:       c1zstore.IngestInvariantVerificationMode(r.GetIngestInvariantMode()),
+	}
+	if !verification.IsVerified() {
+		verification = c1zstore.IngestInvariantVerification{}
+	}
 	out := &c1zstore.SyncRun{
-		ID:           r.GetSyncId(),
-		Type:         syncTypeV3ToConnectorstore(r.GetType()),
-		SyncToken:    r.GetSyncToken(),
-		ParentSyncID: r.GetParentSyncId(),
-		LinkedSyncID: r.GetLinkedSyncId(),
-		SupportsDiff: r.GetSupportsDiff(),
+		ID:                          r.GetSyncId(),
+		Type:                        syncTypeV3ToConnectorstore(r.GetType()),
+		SyncToken:                   r.GetSyncToken(),
+		ParentSyncID:                r.GetParentSyncId(),
+		LinkedSyncID:                r.GetLinkedSyncId(),
+		SupportsDiff:                r.GetSupportsDiff(),
+		IngestInvariantVerification: verification,
 	}
 	if t := r.GetStartedAt(); t != nil {
 		tt := t.AsTime()
@@ -139,16 +205,25 @@ func syncRunRecordToExported(r *v3.SyncRunRecord) *c1zstore.SyncRun {
 // which would silently pick the wrong sync to prune. Sorting on
 // started_at (with sync_id tiebreaker) matches the SQLite engine's
 // ListSyncRuns ORDER BY id ASC semantics.
-func (a *Adapter) sortedSyncRuns(ctx context.Context) ([]c1zstore.SyncRun, error) {
+func (e *Engine) sortedSyncRuns(ctx context.Context) ([]c1zstore.SyncRun, error) {
 	var out []c1zstore.SyncRun
-	err := a.engine.IterateAllSyncRuns(ctx, func(r *v3.SyncRunRecord) bool {
+	err := e.IterateAllSyncRuns(ctx, func(r *v3.SyncRunRecord) bool {
+		verification := c1zstore.IngestInvariantVerification{
+			Generation: r.GetIngestInvariantGeneration(),
+			Coverage:   append([]string(nil), r.GetIngestInvariantCoverage()...),
+			Mode:       c1zstore.IngestInvariantVerificationMode(r.GetIngestInvariantMode()),
+		}
+		if !verification.IsVerified() {
+			verification = c1zstore.IngestInvariantVerification{}
+		}
 		cand := c1zstore.SyncRun{
-			ID:           r.GetSyncId(),
-			Type:         syncTypeV3ToConnectorstore(r.GetType()),
-			SyncToken:    r.GetSyncToken(),
-			ParentSyncID: r.GetParentSyncId(),
-			SupportsDiff: r.GetSupportsDiff(),
-			LinkedSyncID: r.GetLinkedSyncId(),
+			ID:                          r.GetSyncId(),
+			Type:                        syncTypeV3ToConnectorstore(r.GetType()),
+			SyncToken:                   r.GetSyncToken(),
+			ParentSyncID:                r.GetParentSyncId(),
+			SupportsDiff:                r.GetSupportsDiff(),
+			LinkedSyncID:                r.GetLinkedSyncId(),
+			IngestInvariantVerification: verification,
 		}
 		if t := r.GetStartedAt(); t != nil {
 			tt := t.AsTime()
@@ -187,8 +262,8 @@ func (a *Adapter) sortedSyncRuns(ctx context.Context) ([]c1zstore.SyncRun, error
 // c1zstore.SelectSyncsToDelete depends on this ordering so "drop the
 // oldest overflow" trims the right end. Used by pkg/dotc1z's Pebble
 // store to drive the retention policy at Cleanup.
-func (a *Adapter) CleanupCandidates(ctx context.Context) ([]c1zstore.SyncRun, error) {
-	out, err := a.sortedSyncRuns(ctx)
+func (e *Engine) CleanupCandidates(ctx context.Context) ([]c1zstore.SyncRun, error) {
+	out, err := e.sortedSyncRuns(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("pebble CleanupCandidates: IterateAllSyncRuns: %w", err)
 	}
@@ -204,8 +279,8 @@ func (a *Adapter) CleanupCandidates(ctx context.Context) ([]c1zstore.SyncRun, er
 // ListSyncRuns and are not used. It backs the c1z sanitizer's
 // source-side sync-graph-metadata read (linked_sync_id, supports_diff),
 // which the gRPC reader surface does not carry.
-func (a *Adapter) ListSyncRuns(ctx context.Context, pageToken string, pageSize uint32) ([]*c1zstore.SyncRun, string, error) {
-	runs, err := a.sortedSyncRuns(ctx)
+func (e *Engine) ListSyncRuns(ctx context.Context, pageToken string, pageSize uint32) ([]*c1zstore.SyncRun, string, error) {
+	runs, err := e.sortedSyncRuns(ctx)
 	if err != nil {
 		return nil, "", fmt.Errorf("pebble ListSyncRuns: %w", err)
 	}

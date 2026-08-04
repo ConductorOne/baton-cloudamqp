@@ -5,9 +5,10 @@ import (
 	"math"
 	"time"
 
-	"github.com/cockroachdb/pebble/v2"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/types/known/timestamppb"
+
+	"github.com/conductorone/baton-sdk/pkg/dotc1z/engine/pebble/internal/rawdb"
 )
 
 const (
@@ -109,35 +110,11 @@ func rawTimestampNanos(value []byte) (int64, error) {
 	return seconds*int64(time.Second) + int64(nanos), nil
 }
 
-func (e *Engine) deleteResourceIndexesRaw(batch *pebble.Batch, resourceTypeID string, resourceID string, value []byte) error {
-	parentRT, parentID, err := scanResourceParentRaw(value)
-	if err != nil {
-		return err
-	}
-	if parentID == "" {
-		return nil
-	}
-	return batch.Delete(encodeResourceByParentIndexKey(parentRT, parentID, resourceTypeID, resourceID), nil)
-}
-
-func (e *Engine) deleteGrantIndexesRaw(batch *pebble.Batch, externalID string, value []byte) error {
-	entRT, entRID, entID, principalRT, principalID, _, err := scanGrantIndexFieldsRaw(value)
-	if err != nil {
-		return err
-	}
-	if entID == "" || entRT == "" || entRID == "" || principalRT == "" || principalID == "" {
-		return nil
-	}
-	id := grantIdentity{
-		entitlement:     entitlementIdentityFromParts(entRT, entRID, entID),
-		principalTypeID: principalRT,
-		principalID:     principalID,
-	}
-	if err := batch.Delete(encodeGrantByPrincipalIdentityIndexKey(id), nil); err != nil {
-		return err
-	}
-	return batch.Delete(encodeGrantByNeedsExpansionIdentityIndexKey(id), nil)
-}
+// NOTE (2b): deleteResourceIndexesRaw / deleteGrantIndexesRaw are GONE.
+// Prior-row index cleanup is an obligation of rawdb's typed record ops
+// (StageGrantPutInline/StageGrantDelete derive cleanup keys from the
+// primary key; StageResourcePut/StageResourceDelete consume the prior
+// value through the ResourceParent deriver).
 
 // scanGrantExternalIDRaw extracts only the stored external_id (field 2)
 // from a marshaled GrantRecord. Used by the bare-id grant lookup to check
@@ -200,7 +177,7 @@ func scanGrantEntitlementResourceTypeRaw(value []byte) ([]byte, error) {
 		if n < 0 {
 			return nil, protowire.ParseError(n)
 		}
-		if err := scanResourceRefRawBytes(msg, func(fnum protowire.Number, val []byte) {
+		if err := rawdb.ScanResourceRefRawBytes(msg, func(fnum protowire.Number, val []byte) {
 			if fnum == 1 {
 				entRT = val
 			}
@@ -210,6 +187,62 @@ func scanGrantEntitlementResourceTypeRaw(value []byte) ([]byte, error) {
 		value = value[n:]
 	}
 	return entRT, nil
+}
+
+// scanGrantSourceKeysRawBytes extracts the source-entitlement ID keys
+// from a marshaled GrantRecord without a full unmarshal. Sources are
+// field 9 (map<string, GrantSourceRecord>), encoded as repeated embedded
+// messages each with sub-field 1 = key string. The keys are views
+// borrowed from value (valid only while value's backing bytes are),
+// appended to keys — pass a recycled keys[:0] to reuse its backing
+// array across calls. The seal-time grant digest build calls this once
+// per grant (see appendGrantHashIndexRow).
+func scanGrantSourceKeysRawBytes(value []byte, out [][]byte) ([][]byte, error) {
+	for len(value) > 0 {
+		num, typ, n := protowire.ConsumeTag(value)
+		if n < 0 {
+			return nil, protowire.ParseError(n)
+		}
+		value = value[n:]
+		if num != 9 {
+			n = protowire.ConsumeFieldValue(num, typ, value)
+			if n < 0 {
+				return nil, protowire.ParseError(n)
+			}
+			value = value[n:]
+			continue
+		}
+		if typ != protowire.BytesType {
+			return nil, fmt.Errorf("raw record: grant sources entry has wire type %v", typ)
+		}
+		entry, n := protowire.ConsumeBytes(value)
+		if n < 0 {
+			return nil, protowire.ParseError(n)
+		}
+		value = value[n:]
+		for len(entry) > 0 {
+			eNum, eTyp, en := protowire.ConsumeTag(entry)
+			if en < 0 {
+				return nil, protowire.ParseError(en)
+			}
+			entry = entry[en:]
+			if eNum == 1 && eTyp == protowire.BytesType {
+				k, kn := protowire.ConsumeBytes(entry)
+				if kn < 0 {
+					return nil, protowire.ParseError(kn)
+				}
+				out = append(out, k)
+				entry = entry[kn:]
+			} else {
+				en = protowire.ConsumeFieldValue(eNum, eTyp, entry)
+				if en < 0 {
+					return nil, protowire.ParseError(en)
+				}
+				entry = entry[en:]
+			}
+		}
+	}
+	return out, nil
 }
 
 // scanEntitlementResourceTypeRaw extracts only the entitlement's
@@ -241,7 +274,7 @@ func scanEntitlementResourceTypeRaw(value []byte) ([]byte, error) {
 		if n < 0 {
 			return nil, protowire.ParseError(n)
 		}
-		if err := scanResourceRefRawBytes(msg, func(fnum protowire.Number, val []byte) {
+		if err := rawdb.ScanResourceRefRawBytes(msg, func(fnum protowire.Number, val []byte) {
 			if fnum == 1 {
 				rt = val
 			}
@@ -251,43 +284,6 @@ func scanEntitlementResourceTypeRaw(value []byte) ([]byte, error) {
 		value = value[n:]
 	}
 	return rt, nil
-}
-
-// scanResourceParentRaw and scanEntitlementResourceRaw keep the LAST
-// occurrence of the target field, matching scanGrantIndexFieldsRaw and
-// approximating proto merge semantics. Values written by this SDK carry
-// at most one occurrence, so this only matters for foreign writers.
-func scanResourceParentRaw(value []byte) (string, string, error) {
-	var rt, id string
-	for len(value) > 0 {
-		num, typ, n := protowire.ConsumeTag(value)
-		if n < 0 {
-			return "", "", protowire.ParseError(n)
-		}
-		value = value[n:]
-		if num != 6 {
-			n = protowire.ConsumeFieldValue(num, typ, value)
-			if n < 0 {
-				return "", "", protowire.ParseError(n)
-			}
-			value = value[n:]
-			continue
-		}
-		if typ != protowire.BytesType {
-			return "", "", fmt.Errorf("raw record: resource parent has wire type %v", typ)
-		}
-		msg, n := protowire.ConsumeBytes(value)
-		if n < 0 {
-			return "", "", protowire.ParseError(n)
-		}
-		var err error
-		rt, id, err = scanResourceRefRaw(msg)
-		if err != nil {
-			return "", "", err
-		}
-		value = value[n:]
-	}
-	return rt, id, nil
 }
 
 func scanEntitlementResourceRaw(value []byte) (string, string, error) {
@@ -314,7 +310,7 @@ func scanEntitlementResourceRaw(value []byte) (string, string, error) {
 			return "", "", protowire.ParseError(n)
 		}
 		var err error
-		rt, id, err = scanResourceRefRaw(msg)
+		rt, id, err = rawdb.ScanResourceRefRaw(msg)
 		if err != nil {
 			return "", "", err
 		}
@@ -351,7 +347,7 @@ func scanEntitlementIdentityFieldsRaw(value []byte) (string, string, string, err
 				return "", "", "", protowire.ParseError(n)
 			}
 			var err error
-			rt, id, err = scanResourceRefRaw(msg)
+			rt, id, err = rawdb.ScanResourceRefRaw(msg)
 			if err != nil {
 				return "", "", "", err
 			}
@@ -458,23 +454,9 @@ func scanGrantNeedsExpansionRaw(value []byte) (bool, error) {
 	return needsExpansion, nil
 }
 
-func scanResourceRefRaw(value []byte) (string, string, error) {
-	var rt, id []byte
-	err := scanResourceRefRawBytes(value, func(num protowire.Number, val []byte) {
-		switch num {
-		case 1:
-			rt = val
-		case 2:
-			id = val
-		default:
-		}
-	})
-	return string(rt), string(id), err
-}
-
 func scanEntitlementRefRaw(value []byte) (string, string, string, error) {
 	var rt, rid, eid []byte
-	err := scanResourceRefRawBytes(value, func(num protowire.Number, val []byte) {
+	err := rawdb.ScanResourceRefRawBytes(value, func(num protowire.Number, val []byte) {
 		switch num {
 		case 1:
 			rt = val
@@ -490,7 +472,7 @@ func scanEntitlementRefRaw(value []byte) (string, string, string, error) {
 
 func scanPrincipalRefRaw(value []byte) (string, string, error) {
 	var rt, id []byte
-	err := scanResourceRefRawBytes(value, func(num protowire.Number, val []byte) {
+	err := rawdb.ScanResourceRefRawBytes(value, func(num protowire.Number, val []byte) {
 		switch num {
 		case 1:
 			rt = val
@@ -500,33 +482,4 @@ func scanPrincipalRefRaw(value []byte) (string, string, error) {
 		}
 	})
 	return string(rt), string(id), err
-}
-
-func scanResourceRefRawBytes(value []byte, set func(protowire.Number, []byte)) error {
-	for len(value) > 0 {
-		num, typ, n := protowire.ConsumeTag(value)
-		if n < 0 {
-			return protowire.ParseError(n)
-		}
-		value = value[n:]
-		if typ != protowire.BytesType {
-			n = protowire.ConsumeFieldValue(num, typ, value)
-			if n < 0 {
-				return protowire.ParseError(n)
-			}
-			value = value[n:]
-			continue
-		}
-		b, n := protowire.ConsumeBytes(value)
-		if n < 0 {
-			return protowire.ParseError(n)
-		}
-		switch num {
-		case 1, 2, 3:
-			set(num, b)
-		default:
-		}
-		value = value[n:]
-	}
-	return nil
 }

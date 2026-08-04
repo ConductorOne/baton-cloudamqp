@@ -11,7 +11,10 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/vfs"
+
 	v3 "github.com/conductorone/baton-sdk/pb/c1/storage/v3"
+	"github.com/conductorone/baton-sdk/pkg/dotc1z/engine/pebble/internal/rawdb"
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
@@ -22,11 +25,11 @@ import (
 func (e *Engine) migrateIDIndexFormatToStructuredV1(ctx context.Context) error {
 	start := time.Now()
 	l := ctxzap.Extract(ctx)
-	dir, err := os.MkdirTemp("", "pebble-id-index-migration-")
+	dir, err := e.prepareStagingDir("", "pebble-id-index-migration-")
 	if err != nil {
 		return fmt.Errorf("id-index migration: mkdir temp: %w", err)
 	}
-	defer os.RemoveAll(dir)
+	defer e.removeStagingDir(dir)
 
 	sortSem := make(chan struct{}, 4)
 	// 128MiB chunks (deferredIndexSpillChunkBytes), not the bulk import's
@@ -75,9 +78,9 @@ func (e *Engine) migrateIDIndexFormatToStructuredV1(ctx context.Context) error {
 		var path string
 		var err error
 		if r.name == "grant-primary" {
-			path, err = finalizeGrantPrimaryMigrationSorter(ctx, dir, r.name, r.sorter, byPrincipal, byNeedsExpansion)
+			path, err = finalizeGrantPrimaryMigrationSorter(ctx, e.fs(), dir, r.name, r.sorter, byPrincipal, byNeedsExpansion)
 		} else {
-			path, err = finalizeMigrationSorter(ctx, dir, r.name, r.sorter)
+			path, err = finalizeMigrationSorter(ctx, e.fs(), dir, r.name, r.sorter)
 		}
 		if err != nil {
 			return err
@@ -93,7 +96,7 @@ func (e *Engine) migrateIDIndexFormatToStructuredV1(ctx context.Context) error {
 		{GrantByPrincipalResourceTypeLowerBound(), GrantByPrincipalResourceTypeUpperBound()},
 		{GrantByEntitlementResourceLowerBound(), GrantByEntitlementResourceUpperBound()},
 	} {
-		if err := e.db.DeleteRange(r[0], r[1], pebble.Sync); err != nil {
+		if err := e.db.DropKeyRange(r[0], r[1], pebble.Sync); err != nil {
 			return fmt.Errorf("id-index migration: delete dropped range: %w", err)
 		}
 	}
@@ -239,7 +242,7 @@ func (e *Engine) emitStructuredGrantMigration(ctx context.Context, primary *spil
 	return rows, iter.Error()
 }
 
-func finalizeMigrationSorter(ctx context.Context, dir, name string, sorter *spillSorter) (string, error) {
+func finalizeMigrationSorter(ctx context.Context, fs vfs.FS, dir, name string, sorter *spillSorter) (string, error) {
 	chunks, err := sorter.finalize()
 	if err != nil {
 		return "", err
@@ -248,7 +251,7 @@ func finalizeMigrationSorter(ctx context.Context, dir, name string, sorter *spil
 		return "", nil
 	}
 	path := filepath.Join(dir, name+".sst")
-	if err := mergeSortedSpillChunksToSST(ctx, path, name, chunks); err != nil {
+	if err := mergeSortedSpillChunksToSST(ctx, fs, path, name, chunks); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -256,13 +259,13 @@ func finalizeMigrationSorter(ctx context.Context, dir, name string, sorter *spil
 
 func (e *Engine) replaceRangeWithSST(ctx context.Context, lower, upper []byte, path string) error {
 	if path == "" {
-		return e.db.DeleteRange(lower, upper, pebble.Sync)
+		return e.db.DropKeyRange(lower, upper, pebble.Sync)
 	}
-	_, err := e.db.IngestAndExcise(ctx, []string{path}, nil, nil, pebble.KeyRange{Start: lower, End: upper})
+	err := e.db.ReplaceRangeWithSSTs(ctx, []string{path}, pebble.KeyRange{Start: lower, End: upper})
 	return err
 }
 
-func finalizeGrantPrimaryMigrationSorter(ctx context.Context, dir, name string, sorter, byPrincipal, byNeedsExpansion *spillSorter) (string, error) {
+func finalizeGrantPrimaryMigrationSorter(ctx context.Context, fs vfs.FS, dir, name string, sorter, byPrincipal, byNeedsExpansion *spillSorter) (string, error) {
 	chunks, err := sorter.finalize()
 	if err != nil {
 		return "", err
@@ -271,13 +274,13 @@ func finalizeGrantPrimaryMigrationSorter(ctx context.Context, dir, name string, 
 		return "", nil
 	}
 	path := filepath.Join(dir, name+".sst")
-	if err := mergeGrantPrimaryMigrationChunksToSST(ctx, path, name, chunks, byPrincipal, byNeedsExpansion); err != nil {
+	if err := mergeGrantPrimaryMigrationChunksToSST(ctx, fs, path, name, chunks, byPrincipal, byNeedsExpansion); err != nil {
 		return "", err
 	}
 	return path, nil
 }
 
-func mergeGrantPrimaryMigrationChunksToSST(ctx context.Context, sstPath, name string, chunks []string, byPrincipal, byNeedsExpansion *spillSorter) error {
+func mergeGrantPrimaryMigrationChunksToSST(ctx context.Context, fs vfs.FS, sstPath, name string, chunks []string, byPrincipal, byNeedsExpansion *spillSorter) error {
 	readers := make([]*os.File, 0, len(chunks))
 	defer func() {
 		for _, r := range readers {
@@ -305,7 +308,7 @@ func mergeGrantPrimaryMigrationChunksToSST(ctx context.Context, sstPath, name st
 		}
 	}
 
-	w, err := newBulkSSTWriter(filepath.Dir(sstPath), name)
+	w, err := newBulkSSTWriter(fs, filepath.Dir(sstPath), name)
 	if err != nil {
 		return err
 	}
@@ -313,7 +316,7 @@ func mergeGrantPrimaryMigrationChunksToSST(ctx context.Context, sstPath, name st
 	defer func() {
 		if !success {
 			_ = w.finish()
-			_ = os.Remove(w.path)
+			_ = fs.Remove(w.path)
 		}
 	}()
 
@@ -361,7 +364,7 @@ func mergeGrantPrimaryMigrationChunksToSST(ctx context.Context, sstPath, name st
 		// permutation; by_needs_expansion shares the primary's exact tail
 		// (header swap only). Only the flag needs a value read, via a
 		// single-field shallow scan.
-		idxKey, ok := appendGrantByPrincipalKeyFromPrimary(idxKeyScratch[:0], key)
+		idxKey, ok := rawdb.AppendGrantByPrincipalKeyFromPrimary(idxKeyScratch[:0], key)
 		idxKeyScratch = idxKey
 		if !ok {
 			return fmt.Errorf("id-index migration: grant primary key %x did not decode as a 6-segment identity", key)
@@ -387,7 +390,9 @@ func mergeGrantPrimaryMigrationChunksToSST(ctx context.Context, sstPath, name st
 		return err
 	}
 	if w.path != sstPath {
-		if err := os.Rename(w.path, sstPath); err != nil {
+		// Engine FS, not os: the writer created this SST through fs and
+		// the pebble.DB will read it at IngestAndExcise through fs.
+		if err := fs.Rename(w.path, sstPath); err != nil {
 			return err
 		}
 	}

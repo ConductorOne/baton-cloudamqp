@@ -7,6 +7,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
+	reader_v2 "github.com/conductorone/baton-sdk/pb/c1/reader/v2"
 	"github.com/conductorone/baton-sdk/pkg/connectorstore"
 	"github.com/conductorone/baton-sdk/pkg/dotc1z/c1zstore"
 	"github.com/conductorone/baton-sdk/pkg/types/sessions"
@@ -17,11 +18,12 @@ import (
 // wrapper structs satisfy each sub-interface. These assertions catch
 // signature drift at build time rather than at the first runtime call.
 var (
-	_ c1zstore.Store      = (*C1File)(nil)
-	_ c1zstore.GrantStore = c1FileGrantStore{}
-	_ c1zstore.SyncMeta   = c1FileSyncMeta{}
-	_ c1zstore.FileOps    = c1FileFileOps{}
-	_ SessionStore        = c1FileSessionStore{}
+	_ c1zstore.Store                             = (*C1File)(nil)
+	_ c1zstore.GrantStore                        = c1FileGrantStore{}
+	_ c1zstore.SyncMeta                          = c1FileSyncMeta{}
+	_ c1zstore.IngestInvariantVerificationWriter = c1FileSyncMeta{}
+	_ c1zstore.FileOps                           = c1FileFileOps{}
+	_ SessionStore                               = c1FileSessionStore{}
 )
 
 // Grants returns the grant-store slice of this c1z.
@@ -274,6 +276,18 @@ func (s c1FileSyncMeta) MarkSyncSupportsDiff(ctx context.Context, syncID string)
 	return s.c.SetSupportsDiff(ctx, syncID)
 }
 
+func (s c1FileSyncMeta) MarkIngestInvariantsVerified(
+	ctx context.Context,
+	syncID string,
+	verification c1zstore.IngestInvariantVerification,
+) error {
+	return s.c.markIngestInvariantsVerified(ctx, syncID, verification)
+}
+
+func (s c1FileSyncMeta) ClearIngestInvariantVerification(ctx context.Context, syncID string) error {
+	return s.c.clearIngestInvariantVerification(ctx, syncID)
+}
+
 // LatestFullSync implements SyncMeta. Returns the most-recent finished
 // SyncTypeFull run, or nil if none.
 func (s c1FileSyncMeta) LatestFullSync(ctx context.Context) (*c1zstore.SyncRun, error) {
@@ -297,6 +311,11 @@ func (s c1FileSyncMeta) LatestFinishedSyncOfAnyType(ctx context.Context) (*c1zst
 // Stats implements SyncMeta. Signature matches *C1File.Stats exactly.
 func (s c1FileSyncMeta) Stats(ctx context.Context, syncType connectorstore.SyncType, syncID string) (map[string]int64, error) {
 	return s.c.Stats(ctx, syncType, syncID)
+}
+
+// StatsV2 implements SyncMeta. Signature matches *C1File.StatsV2 exactly.
+func (s c1FileSyncMeta) StatsV2(ctx context.Context, syncType connectorstore.SyncType, syncID string) (*reader_v2.SyncStats, error) {
+	return s.c.StatsV2(ctx, syncType, syncID)
 }
 
 // RecalculateStats implements SyncMeta. Thin passthrough to

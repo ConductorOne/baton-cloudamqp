@@ -29,17 +29,35 @@ func encodeIDIndexFormatKey() []byte {
 	return codec.AppendTupleStrings(buf, "grant_entitlement_id_format")
 }
 
-// encodeDeferredIdxPendingKey is the durable marker that grant writes have
-// skipped the inline by_principal index and a deferred rebuild is owed. The
-// in-memory deferredIdxPending flag alone cannot survive a process restart:
-// a sync interrupted after its expansion writes and resumed in a fresh
-// process would otherwise write nothing (idempotent re-run), never re-arm
-// the flag, and EndSync would skip the rebuild — saving a "finished" c1z
-// whose by_principal index misses every deferred-written grant.
-func encodeDeferredIdxPendingKey() []byte {
-	buf := make([]byte, 0, 2+len("deferred_grant_idx_pending"))
+// The deferred-index rebuild marker (rawdb.DeferredIdxPendingKey) and
+// its arm/clear/restore contract moved to rawdb, which owns the
+// deferred-index crash state (see rawdb.ArmDeferredGrantIndex).
+
+// encodeGrantDigestBuildPendingKey is the durable marker that a grant
+// digest build is mid-flight: armed (fsync'd) before the build's first
+// digest-node commit, cleared only after the whole build — merge, hash
+// index ingest, zero-grant root backfill — has completed
+// (buildGrantDigestsFromSpill), and consumed by the drop that restores
+// the safe "digests absent" state (dropAllGrantDigestStateLocked).
+//
+// It exists because the build commits digest nodes in bounded batches
+// DURING the merge and again at fold.finish() — including the global
+// root — before the hash-index IngestAndExcise. Committed WAL writes
+// survive a process kill, so a crash inside that window leaves
+// correct-looking digest roots durable over a hash index that was never
+// ingested; a resumed EndSync's RepairMissingGrantDigests would trust
+// every surviving root (or fast-path on the global root) and seal the
+// file with digests over an empty index — the silent
+// skip-entitlements-at-uplift failure mode. The fused seal pass is
+// additionally protected by deferredIdxPending (a crash reruns the full
+// build), but the standalone BuildGrantDigests path has no such marker,
+// and this one covers both. Marker present at Open (or at repair) →
+// drop all digest state first: every crash converts to "digests
+// absent", which present-means-exact (digest.go) already treats as safe.
+func encodeGrantDigestBuildPendingKey() []byte {
+	buf := make([]byte, 0, 2+len("grant_digest_build_pending"))
 	buf = append(buf, versionV3, typeEngineMeta)
-	return codec.AppendTupleStrings(buf, "deferred_grant_idx_pending")
+	return codec.AppendTupleStrings(buf, "grant_digest_build_pending")
 }
 
 func (e *Engine) readIDIndexFormat() (uint32, error) {
@@ -60,7 +78,7 @@ func (e *Engine) readIDIndexFormat() (uint32, error) {
 func (e *Engine) writeIDIndexFormat(version uint32) error {
 	var buf [4]byte
 	binary.BigEndian.PutUint32(buf[:], version)
-	return e.db.Set(encodeIDIndexFormatKey(), buf[:], pebble.Sync)
+	return e.db.MetaSet(encodeIDIndexFormatKey(), buf[:], pebble.Sync)
 }
 
 func (e *Engine) verifyOrStampIDIndexFormat(ctx context.Context) error {

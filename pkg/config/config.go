@@ -33,5 +33,10 @@ var (
 )
 
 //go:generate go run ./gen
-var Config = field.NewConfiguration(ConfigurationFields)
+var Config = field.NewConfiguration(
+	ConfigurationFields,
+	field.WithConnectorDisplayName("CloudAMQP"),
+	field.WithHelpUrl("/docs/baton/cloudamqp"),
+	field.WithIconUrl("/static/app-icons/cloudamqp.svg"),
+)
 

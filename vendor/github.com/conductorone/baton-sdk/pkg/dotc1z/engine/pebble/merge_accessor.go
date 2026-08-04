@@ -11,33 +11,42 @@ import (
 	v3 "github.com/conductorone/baton-sdk/pb/c1/storage/v3"
 	"github.com/conductorone/baton-sdk/pkg/connectorstore"
 	"github.com/conductorone/baton-sdk/pkg/dotc1z/engine/pebble/codec"
+	"github.com/conductorone/baton-sdk/pkg/dotc1z/engine/pebble/internal/rawdb"
 )
 
-// engineAccessor is implemented by *Adapter and by pkg/dotc1z's Pebble
-// store wrapper (which embeds *Adapter and overrides the method with a
-// nil-safe version).
+// FoldBatch is an exported alias for the choke point's fold-exempt
+// batch (internal/rawdb). The synccompactor/pebble package — the
+// choke point's one sanctioned external client, via the Engine's
+// merge surface (merge_surface.go) — needs to NAME the type in struct
+// fields, which the internal-package import fence forbids; an alias
+// is referable without the import.
+type FoldBatch = rawdb.FoldBatch
+
+// engineAccessor is implemented by *Engine itself and by pkg/dotc1z's
+// Pebble store wrapper (which embeds *Engine and overrides the method
+// with a nil-safe version).
 type engineAccessor interface {
 	PebbleEngine() *Engine
 }
 
-// PebbleEngine returns the underlying *Engine. Nil-safe so AsEngine can
-// probe arbitrary writers.
-func (a *Adapter) PebbleEngine() *Engine {
-	if a == nil {
+// PebbleEngine returns the engine. Nil-safe so AsEngine can probe
+// arbitrary writers.
+func (e *Engine) PebbleEngine() *Engine {
+	if e == nil {
 		return nil
 	}
-	return a.engine
+	return e
 }
 
 // AsEngine recovers the underlying *Engine from a connectorstore.Writer
 // produced by dotc1z.NewStore for the Pebble engine. NewStore returns a
-// wrapper that embeds *Adapter; a bare *Adapter is also accepted for
-// callers that construct one directly. Returns (nil, false) for any
+// wrapper that embeds *Engine; a bare *Engine is also accepted for
+// callers that hold one directly. Returns (nil, false) for any
 // non-Pebble store, so a caller can branch on the engine without
 // importing internal types.
 func AsEngine(w connectorstore.Writer) (*Engine, bool) {
-	if a, ok := w.(engineAccessor); ok {
-		if e := a.PebbleEngine(); e != nil {
+	if acc, ok := w.(engineAccessor); ok {
+		if e := acc.PebbleEngine(); e != nil {
 			return e, true
 		}
 	}
@@ -78,8 +87,7 @@ func ReadSyncStatsRecord(ctx context.Context, e *Engine, syncID string) (*v3.Syn
 
 // SyncStatsFromRecord converts the engine-internal stats sidecar shape
 // into the public reader stats type used by C1ZStore APIs and compactor
-// planning. The public type intentionally has no assets field, so assets
-// remain available only on the sidecar record.
+// planning.
 func SyncStatsFromRecord(stats *v3.SyncStatsRecord) *reader_v2.SyncStats {
 	if stats == nil {
 		return nil
@@ -89,10 +97,34 @@ func SyncStatsFromRecord(stats *v3.SyncStatsRecord) *reader_v2.SyncStats {
 		Resources:                  stats.GetResources(),
 		Entitlements:               stats.GetEntitlements(),
 		Grants:                     stats.GetGrants(),
+		Assets:                     stats.GetAssets(),
 		ResourcesByResourceType:    stats.GetResourcesByResourceType(),
 		EntitlementsByResourceType: stats.GetEntitlementsByResourceType(),
 		GrantsByResourceType:       stats.GetGrantsByEntitlementResourceType(),
+		StepDurationsMs:            stats.GetStepDurationsMs(),
+		ConnectorCallStats:         storageCallStatsToReader(stats.GetConnectorCallStats()),
+		SessionStoreStats:          storageCallStatsToReader(stats.GetSessionStoreStats()),
 	}.Build()
+}
+
+func storageCallStatsToReader(in map[string]*v3.CallStat) map[string]*reader_v2.CallStat {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]*reader_v2.CallStat, len(in))
+	for k, v := range in {
+		if v == nil {
+			continue
+		}
+		out[k] = reader_v2.CallStat_builder{
+			Count:    v.GetCount(),
+			TotalMs:  v.GetTotalMs(),
+			MaxMs:    v.GetMaxMs(),
+			Errors:   v.GetErrors(),
+			Timeouts: v.GetTimeouts(),
+		}.Build()
+	}
+	return out
 }
 
 func CachedSyncStats(ctx context.Context, e *Engine, syncID string) (*reader_v2.SyncStats, bool, error) {
@@ -165,17 +197,15 @@ func MarkStoreDirty(w connectorstore.Writer) bool {
 // owns a parent temp directory and wants one bulk cleanup after closing many
 // read-only source stores.
 func CloseEngineOnly(w connectorstore.Writer) error {
-	switch s := w.(type) {
-	case engineOnlyCloser:
+	if s, ok := w.(engineOnlyCloser); ok {
 		return s.CloseEngineOnly()
-	case *Adapter:
-		if s == nil || s.engine == nil {
-			return nil
-		}
-		return s.engine.Close()
-	default:
-		return nil
 	}
+	// A bare *Engine (no store wrapper) closes directly — there is no
+	// temp-dir teardown to skip.
+	if e, ok := AsEngine(w); ok {
+		return e.Close()
+	}
+	return nil
 }
 
 // NormalizeForFixtureSave flushes and compacts one sync in a Pebble
@@ -227,7 +257,7 @@ func ResourceIndexKeys(r *v3.ResourceRecord) [][]byte {
 	if parent == nil || parent.GetResourceId() == "" {
 		return nil
 	}
-	return [][]byte{encodeResourceByParentIndexKey(parent.GetResourceTypeId(), parent.GetResourceId(), r.GetResourceTypeId(), r.GetResourceId())}
+	return [][]byte{rawdb.EncodeResourceByParentIndexKey(parent.GetResourceTypeId(), parent.GetResourceId(), r.GetResourceTypeId(), r.GetResourceId())}
 }
 
 func ForEachResourceIndexKey(r *v3.ResourceRecord, yield func([]byte) error) error {
@@ -235,14 +265,14 @@ func ForEachResourceIndexKey(r *v3.ResourceRecord, yield func([]byte) error) err
 	if parent == nil || parent.GetResourceId() == "" {
 		return nil
 	}
-	return yield(encodeResourceByParentIndexKey(parent.GetResourceTypeId(), parent.GetResourceId(), r.GetResourceTypeId(), r.GetResourceId()))
+	return yield(rawdb.EncodeResourceByParentIndexKey(parent.GetResourceTypeId(), parent.GetResourceId(), r.GetResourceTypeId(), r.GetResourceId()))
 }
 
 func ForEachResourceIndexKeyRaw(parentRT string, parentID string, resourceTypeID string, resourceID string, yield func([]byte) error) error {
 	if parentID == "" {
 		return nil
 	}
-	return yield(encodeResourceByParentIndexKey(parentRT, parentID, resourceTypeID, resourceID))
+	return yield(rawdb.EncodeResourceByParentIndexKey(parentRT, parentID, resourceTypeID, resourceID))
 }
 
 // Byte-slice appenders let merge/overlay code build index keys from borrowed

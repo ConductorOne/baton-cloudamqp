@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/doug-martin/goqu/v9"
@@ -49,7 +50,7 @@ type C1File struct {
 	viewSyncID         string
 	outputFilePath     string
 	dbFilePath         string
-	dbUpdated          bool
+	dbUpdated          atomic.Bool
 	tempDir            string
 	pragmas            []pragma
 	readOnly           bool
@@ -340,6 +341,12 @@ type c1zOptions struct {
 	v2GrantsWriter     bool
 	bulkLoad           bool
 
+	// disableGrantDigestIndex turns off the Pebble engine's seal-time
+	// build of the by_entitlement_principal_hash index + grant digests.
+	// Inverted so the zero value keeps the build on (current behavior).
+	// See WithGrantDigestIndex.
+	disableGrantDigestIndex bool
+
 	// engine is the storage engine to use for newly created files.
 	// Reads dispatch on magic byte regardless. Default EngineSQLite.
 	engine c1zstore.Engine
@@ -445,6 +452,21 @@ func WithV2GrantsWriter(enabled bool) C1ZOption {
 	}
 }
 
+// WithGrantDigestIndex toggles the Pebble engine's seal-time build of
+// the by_entitlement_principal_hash index and per-entitlement grant
+// digests (the substrate for cross-file grant diffing). Default true.
+//
+// Pass false for files that will never be grant-diffed (local CLI syncs,
+// connector development) to skip the seal-time derivation pass. Safe to
+// toggle: a file sealed with this off stores no digest roots, which
+// readers treat as "missing — recalculate", never as "no grants". No
+// effect on the SQLite engine.
+func WithGrantDigestIndex(enabled bool) C1ZOption {
+	return func(o *c1zOptions) {
+		o.disableGrantDigestIndex = !enabled
+	}
+}
+
 // WithBulkLoad enables deferred secondary-index creation for a
 // freshly-created destination c1z. See WithC1FBulkLoad for the full contract:
 // it is opt-in and never the default; indexes are deferred only on EMPTY
@@ -491,6 +513,9 @@ func NewC1ZFile(ctx context.Context, outputFilePath string, opts ...C1ZOption) (
 	if err != nil {
 		return nil, err
 	}
+	// Ensure c1z decompression honors caller cancellation. Prepended so an
+	// explicit WithDecoderOptions(WithContext(...)) from the caller still wins.
+	options.decoderOptions = append([]DecoderOption{WithContext(ctx)}, options.decoderOptions...)
 
 	if options.engine == c1zstore.EnginePebble && !options.readOnly {
 		err = fmt.Errorf(
@@ -603,7 +628,7 @@ func (c *C1File) Close(ctx context.Context) (retErr error) {
 
 	span.SetAttributes(
 		attribute.Bool("read_only", c.readOnly),
-		attribute.Bool("db_updated", c.dbUpdated),
+		attribute.Bool("db_updated", c.dbUpdated.Load()),
 		attribute.String("db_path", c.dbFilePath),
 	)
 
@@ -614,13 +639,13 @@ func (c *C1File) Close(ctx context.Context) (retErr error) {
 	// open) before returning so a misuse like opening read-only and
 	// then dirtying via an attached-db mutation still releases the
 	// SQLite handle and any FDs/goroutines it owns.
-	if !c.dbUpdated || c.readOnly {
+	if !c.dbUpdated.Load() || c.readOnly {
 		if c.rawDb != nil {
 			if err := c.closeRawDB(ctx); err != nil {
 				return cleanupDbDir(c.dbFilePath, err)
 			}
 		}
-		if c.dbUpdated && c.readOnly {
+		if c.dbUpdated.Load() && c.readOnly {
 			c.closed = true
 			return cleanupDbDir(c.dbFilePath, ErrReadOnly)
 		}
@@ -1180,15 +1205,32 @@ func (c *C1File) RecalculateStats(ctx context.Context, syncId string) error {
 	return err
 }
 
+func (c *C1File) StatsV2(ctx context.Context, syncType connectorstore.SyncType, syncId string) (*reader_v2.SyncStats, error) {
+	ctx, span := tracer.Start(ctx, "C1File.StatsV2")
+	var err error
+	defer func() { uotel.EndSpanWithError(span, err) }()
+
+	_, stats, err := c.stats(ctx, syncType, syncId, false)
+	return stats, err
+}
+
 func (c *C1File) stats(ctx context.Context, syncType connectorstore.SyncType, syncId string, forceRefresh bool) (*reader_v2.SyncRun, *reader_v2.SyncStats, error) {
 	ctx, span := tracer.Start(ctx, "C1File.Stats")
 	var err error
 	defer func() { uotel.EndSpanWithError(span, err) }()
 
 	if syncId == "" {
+		// Empty syncID resolves to the latest finished sync of the
+		// requested type — never an in-progress current sync.
 		syncId, err = c.LatestSyncID(ctx, syncType)
 		if err != nil {
 			return nil, nil, err
+		}
+		if syncId == "" {
+			if syncType == connectorstore.SyncTypeAny || syncType == "" {
+				return nil, nil, status.Error(codes.NotFound, "no finished sync found")
+			}
+			return nil, nil, status.Errorf(codes.NotFound, "no finished sync of type '%s' found", syncType)
 		}
 	}
 
@@ -1223,6 +1265,7 @@ func (c *C1File) stats(ctx context.Context, syncType connectorstore.SyncType, sy
 		Resources:                  0,
 		Entitlements:               0,
 		Grants:                     0,
+		Assets:                     0,
 		ResourcesByResourceType:    make(map[string]int64),
 		GrantsByResourceType:       make(map[string]int64),
 		EntitlementsByResourceType: make(map[string]int64),
@@ -1293,6 +1336,17 @@ func (c *C1File) stats(ctx context.Context, syncType connectorstore.SyncType, sy
 		}
 	}
 
+	assetCount, err := c.countBySync(ctx, assets.Name(), syncId)
+	if err != nil {
+		return nil, nil, fmt.Errorf("count assets: %w", err)
+	}
+	stats.Assets = assetCount
+
+	// Lift timing / call stats from the syncer token into the stats we
+	// are about to cache. Older count-only caches are left as-is on
+	// the fast path above.
+	c1zstore.ApplySyncTokenStats(stats, sync.SyncToken)
+
 	// If sync is ended and c1z is not read-only, save stats to the database.
 	if sync.EndedAt != nil && !c.readOnly {
 		statsJSON, err := json.Marshal(stats)
@@ -1310,7 +1364,7 @@ func (c *C1File) stats(ctx context.Context, syncType connectorstore.SyncType, sy
 		if err != nil {
 			return nil, nil, fmt.Errorf("c1file-stats: error saving stats: %w", err)
 		}
-		c.dbUpdated = true
+		c.dbUpdated.Store(true)
 	}
 
 	return &reader_v2.SyncRun{
@@ -1342,6 +1396,24 @@ func (c *C1File) grantStats(ctx context.Context, syncType connectorstore.SyncTyp
 	}
 
 	return statsMap, nil
+}
+
+// countBySync returns the number of rows in tableName for syncID.
+func (c *C1File) countBySync(ctx context.Context, tableName string, syncID string) (int64, error) {
+	q := c.db.From(tableName).
+		Where(goqu.C("sync_id").Eq(syncID)).
+		Select(goqu.COUNT("*"))
+
+	query, args, err := q.ToSQL()
+	if err != nil {
+		return 0, err
+	}
+
+	var n int64
+	if err := c.db.QueryRowContext(ctx, query, args...).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // countBySyncAndResourceType issues a single GROUP BY query that returns

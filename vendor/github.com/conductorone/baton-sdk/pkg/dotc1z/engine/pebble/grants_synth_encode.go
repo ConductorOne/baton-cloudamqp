@@ -30,11 +30,19 @@ var expandedGrantImmutableAnnotations = []*anypb.Any{expandedGrantImmutableAnnot
 // appendSynthGrantExternalIDWire) and sources (field 9, appended by
 // appendGrantSourcesWire). Expansion/NeedsExpansion stay zero for
 // synthesized grants.
+//
+// SourceScopeKey is cleared unconditionally, for two reasons: synthesized
+// (expander-derived) grants are never part of a source-cache scope, and —
+// load-bearing for appendGrantSourcesWire — an empty proto3 scalar emits no
+// bytes, which keeps sources (field 9) the highest field on the wire so the
+// hand encoder's append-after-base-marshal stays canonical. See
+// TestGrantSourcesWireSchemaPin.
 func fillSynthGrantRecord(r *v3.GrantRecord, rec *synthesizedGrantRecord, now *timestamppb.Timestamp) {
 	r.SetEntitlement(rec.entitlement)
 	r.SetPrincipal(rec.principal)
 	r.SetAnnotations(expandedGrantImmutableAnnotations)
 	r.SetDiscoveredAt(now)
+	r.SetSourceScopeKey("")
 }
 
 // grantExternalIDFieldTag is the wire tag for GrantRecord.external_id (2).
@@ -112,14 +120,14 @@ func appendGrantSourcesWire(dst []byte, scratch batonGrant.Sources, sources bato
 		}
 		keyLen := len(src.EntitlementID)
 		entryLen := 1 + protowire.SizeVarint(uint64(keyLen)) + keyLen +
-			1 + protowire.SizeVarint(uint64(valLen)) + valLen
+			1 + protowire.SizeVarint(uint64(valLen)) + valLen // #nosec G115 -- valLen is 0 or 2.
 		dst = protowire.AppendVarint(dst, grantSourcesFieldTag)
 		dst = protowire.AppendVarint(dst, uint64(entryLen)) // #nosec G115 -- entryLen is a small positive length.
 		dst = protowire.AppendVarint(dst, grantSourceKeyTag)
 		dst = protowire.AppendVarint(dst, uint64(keyLen))
 		dst = append(dst, src.EntitlementID...)
 		dst = protowire.AppendVarint(dst, grantSourceValTag)
-		dst = protowire.AppendVarint(dst, uint64(valLen))
+		dst = protowire.AppendVarint(dst, uint64(valLen)) // #nosec G115 -- valLen is 0 or 2.
 		if src.IsDirect {
 			dst = protowire.AppendVarint(dst, grantSourceDirectTag)
 			dst = protowire.AppendVarint(dst, 1)

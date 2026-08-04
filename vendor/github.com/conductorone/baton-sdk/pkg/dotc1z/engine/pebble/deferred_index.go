@@ -1,80 +1,44 @@
 package pebble
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/vfs"
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
 	"go.uber.org/zap"
 
 	"github.com/conductorone/baton-sdk/pkg/dotc1z/engine/pebble/codec"
+	"github.com/conductorone/baton-sdk/pkg/dotc1z/engine/pebble/internal/rawdb"
 )
 
 // deferredIndexSpillChunkBytes is the spill-chunk arena size for the deferred
-// by_principal index build. The shared bulkSpillKeyChunkBytes (8MiB) is sized
+// index build's sorters. The shared bulkSpillKeyChunkBytes (8MiB) is sized
 // for the bulk import, where lanes × index-families sorters are alive at once
 // and small arenas bound aggregate memory. The deferred build is the opposite
-// shape — one producer, one sorter, nothing else running — and with 8MiB
-// chunks a whale (57M+ index keys ≈ 6.4GB) produced an 801-way final merge:
-// ~10 heap comparisons per entry plus 801 open chunk files with 1MiB readers
-// (~800MB of buffers). 128MiB chunks cut that to ~50 runs. Peak memory is the
-// active arena plus up to `sorters` chunks being sorted in background
-// (~640MB), in the same ballpark as what the wide merge's read buffers used.
-const deferredIndexSpillChunkBytes = 128 << 20
-
-// appendGrantByPrincipalKeyFromPrimary builds the by_principal index key
-// directly from a primary grant key by permuting its tuple segments, into
-// dst. The primary tail is ent_rt|ent_rid|ent_kind|ent_name|p_rt|p_id and the
-// index tail is p_rt|p_id|ent_rt|ent_rid|ent_kind|ent_name — the segments are
-// already escaped, and the tuple escaping is canonical, so splicing the raw
-// bytes is byte-identical to decode + re-encode
-// (encodeGrantByPrincipalIdentityIndexKey ∘ decodeGrantIdentityKey) while
-// skipping six string allocations and a fresh key buffer per row. That
-// decode/re-encode pair was ~7GB of allocations per whale deferred build.
-// Returns ok=false for keys that do not have exactly six segments.
+// shape — one producer, at most two sorter families, nothing else running —
+// and with 8MiB chunks a whale (57M+ index keys ≈ 6.4GB) produced an 801-way
+// final merge: ~10 heap comparisons per entry plus 801 open chunk files with
+// 1MiB readers (~800MB of buffers). 128MiB chunks cut that to ~50 runs.
 //
-// Pinned against the decode+re-encode path by
-// TestAppendGrantByPrincipalKeyFromPrimary.
-func appendGrantByPrincipalKeyFromPrimary(dst, primaryKey []byte) ([]byte, bool) {
-	const prefixLen = 3 // versionV3 | typeGrant | separator
-	if len(primaryKey) < prefixLen || primaryKey[0] != versionV3 || primaryKey[1] != typeGrant || primaryKey[2] != 0 {
-		return dst, false
-	}
-	tail := primaryKey[prefixLen:]
-	// Split into exactly six escaped segments on bare separator bytes (the
-	// escape rules guarantee segments contain no bare 0x00).
-	var segs [6][]byte
-	rest := tail
-	for i := 0; i < 5; i++ {
-		sep := bytes.IndexByte(rest, 0)
-		if sep < 0 {
-			return dst, false
-		}
-		segs[i] = rest[:sep]
-		rest = rest[sep+1:]
-	}
-	if bytes.IndexByte(rest, 0) >= 0 {
-		return dst, false
-	}
-	segs[5] = rest
-
-	dst = append(dst, versionV3, typeIndex, idxGrantByPrincipal, 0)
-	for i, idx := range [6]int{4, 5, 0, 1, 2, 3} { // p_rt, p_id, ent_rt, ent_rid, ent_kind, ent_name
-		if i > 0 {
-			dst = append(dst, 0)
-		}
-		dst = append(dst, segs[idx]...)
-	}
-	return dst, true
-}
+// Memory budget (revised for the second family): with the grant digest
+// index enabled the scan feeds TWO sorter families — by_principal
+// (key-only) and by_entitlement_principal_hash (8-byte values) — which
+// share the sort semaphore, so the peak is two filling arenas plus up
+// to `sorters` (≤4) arenas in background sorts: ≈ 6 × 128MiB = 768MiB,
+// roughly double the single-family budget. That stays acceptable
+// because the build runs alone at EndSync (the sync's write pipeline
+// and its arenas are already drained) and each family's merge width
+// stays ~50 for whale-scale inputs. Each family gets its own bounded
+// freelist sized to the sort concurrency, so retained (idle) arenas
+// are capped at the same order.
+const deferredIndexSpillChunkBytes = 128 << 20
 
 // deferredGrantStats carries the grant-keyspace stats accumulated during the
 // BuildDeferredGrantIndexes scan: the same numbers computeSyncStats derives
@@ -106,6 +70,7 @@ type rebuildBatch struct {
 // and flushed in ~8MiB batches over a small bounded channel: the scan blocks
 // when the writer falls more than a few batches behind. Single producer.
 type grantRebuildTee struct {
+	fs  vfs.FS
 	dir string
 
 	// Scan-thread state: the arena being filled.
@@ -127,8 +92,9 @@ type grantRebuildTee struct {
 	err error
 }
 
-func newGrantRebuildTee(dir string) *grantRebuildTee {
+func newGrantRebuildTee(fs vfs.FS, dir string) *grantRebuildTee {
 	t := &grantRebuildTee{
+		fs:   fs,
 		dir:  dir,
 		ch:   make(chan rebuildBatch, 4),
 		done: make(chan struct{}),
@@ -177,7 +143,7 @@ func (t *grantRebuildTee) run() {
 func (t *grantRebuildTee) writeBatch(b rebuildBatch) error {
 	for _, v := range b.views {
 		if t.writer == nil {
-			w, err := newBulkSSTWriter(t.dir, fmt.Sprintf("grant-rebuild-%03d", t.seq))
+			w, err := newBulkSSTWriter(t.fs, t.dir, fmt.Sprintf("grant-rebuild-%03d", t.seq))
 			if err != nil {
 				return err
 			}
@@ -321,11 +287,11 @@ func (e *Engine) buildDeferredGrantIndexesLocked(ctx context.Context) error {
 	}
 	start := time.Now()
 	l := ctxzap.Extract(ctx)
-	dir, err := os.MkdirTemp("", "pebble-deferred-idx-")
+	dir, err := e.prepareStagingDir("", "pebble-deferred-idx-")
 	if err != nil {
 		return fmt.Errorf("BuildDeferredGrantIndexes: mkdir temp: %w", err)
 	}
-	defer os.RemoveAll(dir)
+	defer e.removeStagingDir(dir)
 
 	sorters := min(4, max(2, runtime.GOMAXPROCS(0)/2))
 	sem := make(chan struct{}, sorters)
@@ -337,6 +303,18 @@ func (e *Engine) buildDeferredGrantIndexesLocked(ctx context.Context) error {
 	// RemoveAll defer so LIFO ordering runs the wait first; abort is a
 	// no-op once finalize has drained the sorter.
 	defer principal.abort()
+
+	// Second sorter family: the by_entitlement_principal_hash rows the
+	// grant digests fold over (valued entries — the 8-byte content
+	// hash). Shares the sort semaphore with by_principal; see the
+	// deferredIndexSpillChunkBytes budget note. Nil when the digest
+	// index is disabled.
+	var hashIdx *spillSorter
+	if e.opts.grantDigestIndex {
+		hashIdx = newSpillSorter(dir, fmt.Sprintf("index-%02x", idxGrantByEntitlementPrincipalHash), sem, deferredIndexSpillChunkBytes)
+		hashIdx.free = newSpillArenaFreeList(deferredIndexSpillChunkBytes, sorters+1)
+		defer hashIdx.abort()
+	}
 
 	iter, err := e.db.NewIter(&pebble.IterOptions{
 		LowerBound: GrantLowerBound(),
@@ -356,7 +334,7 @@ func (e *Engine) buildDeferredGrantIndexesLocked(ctx context.Context) error {
 	var totalKeys int64
 	grantsByEntRTPtr := map[string]*int64{}
 
-	rebuild := newGrantRebuildTee(dir)
+	rebuild := newGrantRebuildTee(e.fs(), dir)
 	rebuildFinished := false
 	defer func() {
 		if !rebuildFinished {
@@ -372,6 +350,12 @@ func (e *Engine) buildDeferredGrantIndexesLocked(ctx context.Context) error {
 
 	var scanned, droppedMalformedKeys int64
 	var idxKeyScratch []byte
+	// Hash-index row emission is non-fatal, mirroring the rebuild tee:
+	// remember the first error, stop emitting, keep scanning —
+	// by_principal and the stats stash don't depend on the digests, and
+	// the seal treats a failed digest build as "drop and re-read".
+	var hashScanErr error
+	var hashScratch grantHashRowScratch
 	lastLog := start
 	for iter.First(); iter.Valid(); iter.Next() {
 		totalKeys++
@@ -395,19 +379,25 @@ func (e *Engine) buildDeferredGrantIndexesLocked(ctx context.Context) error {
 				rebuildScanErr = err
 			}
 		}
-		idxKey, ok := appendGrantByPrincipalKeyFromPrimary(idxKeyScratch[:0], iter.Key())
+		idxKey, ok := rawdb.AppendGrantByPrincipalKeyFromPrimary(idxKeyScratch[:0], iter.Key())
 		idxKeyScratch = idxKey
 		if !ok {
 			// Only possible on key-layout drift or corruption: every grant
 			// write path derives its key from the same 6-segment encoder.
 			// The row still rides the primary rebuild (totalKeys counts it),
-			// but it cannot be represented in by_principal — count and warn
-			// below so a principal silently losing grants is observable.
+			// but it cannot be represented in by_principal (nor in the hash
+			// index/digests) — count and warn below so a principal silently
+			// losing grants is observable.
 			droppedMalformedKeys++
 			continue
 		}
 		if err := principal.add(idxKey, nil); err != nil {
 			return err
+		}
+		if hashIdx != nil && hashScanErr == nil {
+			if err := appendGrantHashIndexRow(hashIdx, iter.Key(), iter.Value(), &hashScratch); err != nil {
+				hashScanErr = err
+			}
 		}
 		scanned++
 		// Throttle per-row bookkeeping; ctx.Err and time.Now are measurable
@@ -489,7 +479,7 @@ func (e *Engine) buildDeferredGrantIndexesLocked(ctx context.Context) error {
 			zap.Int64("rows_rebuilt", rebuilt.rows),
 		)
 	case len(rebuilt.files) > 0:
-		if _, err := e.db.IngestAndExcise(ctx, rebuilt.files, nil, nil, pebble.KeyRange{
+		if err := e.db.ReplaceRangeWithSSTs(ctx, rebuilt.files, pebble.KeyRange{
 			Start: GrantLowerBound(),
 			End:   GrantUpperBound(),
 		}); err != nil {
@@ -516,33 +506,60 @@ func (e *Engine) buildDeferredGrantIndexesLocked(ctx context.Context) error {
 			zap.Int64("index_keys_added", scanned),
 			zap.Duration("total", time.Since(start)),
 		)
-		return nil
-	}
-	l.Info("deferred grant index build: merging sorted chunks",
-		zap.Int("chunks", len(chunks)),
-		zap.Int64("index_keys_added", scanned),
-		zap.Duration("scan", scanDone.Sub(start)),
-	)
-	sstPath := filepath.Join(dir, fmt.Sprintf("index-%02x.sst", idxGrantByPrincipal))
-	if err := mergeSortedSpillChunksToSST(ctx, sstPath, fmt.Sprintf("index-%02x", idxGrantByPrincipal), chunks); err != nil {
-		return err
-	}
-	mergeDone := time.Now()
+	} else {
+		l.Info("deferred grant index build: merging sorted chunks",
+			zap.Int("chunks", len(chunks)),
+			zap.Int64("index_keys_added", scanned),
+			zap.Duration("scan", scanDone.Sub(start)),
+		)
+		sstPath := filepath.Join(dir, fmt.Sprintf("index-%02x.sst", idxGrantByPrincipal))
+		if err := mergeSortedSpillChunksToSST(ctx, e.fs(), sstPath, fmt.Sprintf("index-%02x", idxGrantByPrincipal), chunks); err != nil {
+			return err
+		}
+		mergeDone := time.Now()
 
-	_, err = e.db.IngestAndExcise(ctx, []string{sstPath}, nil, nil, pebble.KeyRange{
-		Start: GrantByPrincipalLowerBound(),
-		End:   GrantByPrincipalUpperBound(),
-	})
-	if err != nil {
-		return fmt.Errorf("BuildDeferredGrantIndexes: ingest/excise: %w", err)
+		err = e.db.ReplaceRangeWithSSTs(ctx, []string{sstPath}, pebble.KeyRange{
+			Start: GrantByPrincipalLowerBound(),
+			End:   GrantByPrincipalUpperBound(),
+		})
+		if err != nil {
+			return fmt.Errorf("BuildDeferredGrantIndexes: ingest/excise: %w", err)
+		}
+
+		l.Info("deferred grant index build complete",
+			zap.Int64("index_keys_scanned", scanned),
+			zap.Duration("scan", scanDone.Sub(start)),
+			zap.Duration("merge", mergeDone.Sub(scanDone)),
+			zap.Duration("ingest", time.Since(mergeDone)),
+			zap.Duration("total", time.Since(start)),
+		)
 	}
 
-	ctxzap.Extract(ctx).Info("deferred grant index build complete",
-		zap.Int64("index_keys_scanned", scanned),
-		zap.Duration("scan", scanDone.Sub(start)),
-		zap.Duration("merge", mergeDone.Sub(scanDone)),
-		zap.Duration("ingest", time.Since(mergeDone)),
-		zap.Duration("total", time.Since(start)),
-	)
+	// Grant digests + hash index, fused onto the same scan. Non-fatal,
+	// like the stats sidecar's treatment of seal-time extras: on ANY
+	// failure — a row emission error remembered mid-scan, a merge or
+	// ingest error here — every digest node and hash-index row is
+	// dropped, because a partially built digest that LOOKS present
+	// would violate the present-means-exact contract (digest.go).
+	// Absent digests just mean a diff consumer re-reads the grants; the
+	// next successful seal recalculates them. Context cancellation
+	// stays fatal — the whole EndSync is being abandoned.
+	if hashIdx != nil {
+		digestErr := hashScanErr
+		if digestErr == nil {
+			digestErr = e.buildGrantDigestsFromSpill(ctx, dir, hashIdx)
+		}
+		if digestErr != nil {
+			if ctx.Err() != nil {
+				return digestErr
+			}
+			l.Error("deferred grant index build: grant digest/hash-index build failed; dropping digest state — grant-diff callers must re-read grants until the next successful seal",
+				zap.Error(digestErr),
+			)
+			if dropErr := e.dropAllGrantDigestStateLocked(); dropErr != nil {
+				return fmt.Errorf("BuildDeferredGrantIndexes: drop grant digest state after failed build: %w", dropErr)
+			}
+		}
+	}
 	return nil
 }

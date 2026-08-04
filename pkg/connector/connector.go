@@ -31,12 +31,14 @@ var (
 	}
 )
 
+var _ connectorbuilder.ConnectorBuilderV2 = (*CloudAMQP)(nil)
+
 type CloudAMQP struct {
 	client *cloudamqp.Client
 }
 
-func (pd *CloudAMQP) ResourceSyncers(ctx context.Context) []connectorbuilder.ResourceSyncer {
-	return []connectorbuilder.ResourceSyncer{
+func (pd *CloudAMQP) ResourceSyncers(ctx context.Context) []connectorbuilder.ResourceSyncerV2 {
+	return []connectorbuilder.ResourceSyncerV2{
 		userBuilder(pd.client),
 		roleBuilder(pd.client),
 	}

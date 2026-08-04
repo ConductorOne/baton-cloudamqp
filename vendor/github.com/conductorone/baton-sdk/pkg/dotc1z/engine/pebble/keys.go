@@ -2,6 +2,7 @@ package pebble
 
 import (
 	"github.com/conductorone/baton-sdk/pkg/dotc1z/engine/pebble/codec"
+	"github.com/conductorone/baton-sdk/pkg/dotc1z/engine/pebble/internal/rawdb"
 )
 
 // Key layout convention.
@@ -49,35 +50,36 @@ import (
 // are an ABI: every v3 c1z file depends on them. Changing them
 // requires a keyspace-version bump (see the stamp in engine.go).
 
-// Type-discriminator bytes for the v3 keyspace. Each top-level
-// keyspace occupies one byte.
+// Type- and index-discriminator bytes for the v3 keyspace. The
+// canonical definitions live in internal/keys (the keyspace ABI shared
+// with rawdb, whose typed record ops derive obligations from these
+// formats directly); aliased here so the engine's encoders read
+// naturally. See internal/keys for the per-byte docs.
 const (
-	versionV3 byte = 0x03
+	versionV3 = rawdb.VersionV3
 
-	typeResourceType byte = 0x01
-	typeResource     byte = 0x02
-	typeEntitlement  byte = 0x03
-	typeGrant        byte = 0x04
-	typeAsset        byte = 0x05
-	typeSyncRun      byte = 0x06
-	typeIndex        byte = 0x07
-	typeCounter      byte = 0x08
-	typeSession      byte = 0x09
-	typeEngineMeta   byte = 0xFF
+	typeResourceType = rawdb.TypeResourceType
+	typeResource     = rawdb.TypeResource
+	typeEntitlement  = rawdb.TypeEntitlement
+	typeGrant        = rawdb.TypeGrant
+	typeAsset        = rawdb.TypeAsset
+	typeSyncRun      = rawdb.TypeSyncRun
+	typeIndex        = rawdb.TypeIndex
+	typeCounter      = rawdb.TypeCounter
+	typeSession      = rawdb.TypeSession
+	typeDigest       = rawdb.TypeDigest
+	typeEngineMeta   = rawdb.TypeEngineMeta
 )
 
-// Index-discriminator bytes (second byte after typeIndex). One byte
-// per declared index across all record types; reuse across record
-// types is fine because the index key is scoped by the type byte that
-// preceded it.
 const (
-	idxResourceByParent             byte = 0x01
-	idxEntitlementByResource        byte = 0x02 // retired: served by entitlement primary key prefixes.
-	idxGrantByEntitlement           byte = 0x03 // retired: grant primary keys are entitlement-first.
-	idxGrantByPrincipal             byte = 0x04
-	idxGrantByNeedsExpansion        byte = 0x05
-	idxGrantByPrincipalResourceType byte = 0x06 // retired: served by idxGrantByPrincipal prefix scans.
-	idxGrantByEntitlementResource   byte = 0x07 // retired: served by grant primary entitlement-resource prefix scans.
+	idxResourceByParent                = rawdb.IdxResourceByParent
+	idxEntitlementByResource           = rawdb.IdxEntitlementByResource
+	idxGrantByEntitlement              = rawdb.IdxGrantByEntitlement
+	idxGrantByPrincipal                = rawdb.IdxGrantByPrincipal
+	idxGrantByNeedsExpansion           = rawdb.IdxGrantByNeedsExpansion
+	idxGrantByPrincipalResourceType    = rawdb.IdxGrantByPrincipalResourceType
+	idxGrantByEntitlementResource      = rawdb.IdxGrantByEntitlementResource
+	idxGrantByEntitlementPrincipalHash = rawdb.IdxGrantByEntitlementPrincipalHash
 )
 
 // --- Grant ---
@@ -270,6 +272,81 @@ func encodeGrantByPrincipalResourceTypeIdentityPrefix(principalRT string) []byte
 	return codec.AppendTupleSeparator(buf)
 }
 
+// --- Grant by (entitlement, principal-hash) + digest nodes ---
+//
+// PARTITION CONVENTION. Both keyspaces below are addressed by a digest
+// "partition": the raw encoded tail of the entitlement's PRIMARY key —
+// the already-escaped, separator-delimited 4-segment tuple
+//
+//	ent_rt | 0x00 | ent_rid | 0x00 | ent_flag | 0x00 | ent_tail
+//
+// exactly as appendEntitlementIdentityKey produces it (minus the 3-byte
+// header), and exactly as it appears inside every grant primary key.
+// Using the encoded bytes (spliced, never decode+re-encoded) keeps the
+// seal-time build allocation-free and makes index/digest partition
+// order byte-identical to primary entitlement key order. Segments are
+// escaped and the segment COUNT is fixed at four, so partitions are
+// mutually prefix-free even though they contain bare 0x00 separators.
+// appendEntitlementIdentityTail is the from-identity constructor.
+
+// appendEntitlementIdentityTail appends the digest-partition bytes for
+// an entitlement identity: the 4-segment encoded tuple tail of its
+// primary key (no header, no trailing separator). MUST stay in
+// byte-lockstep with appendEntitlementIdentityKey's tail.
+func appendEntitlementIdentityTail(dst []byte, id entitlementIdentity) []byte {
+	return codec.AppendTupleStrings(dst, id.resourceTypeID, id.resourceID, id.flagComponent(), id.tail)
+}
+
+// GrantByEntPrincHashLowerBound / UpperBound bound the entire
+// by_entitlement_principal_hash index. Exported for the
+// cleanup/clone/compaction keyspace plans.
+func GrantByEntPrincHashLowerBound() []byte {
+	return []byte{versionV3, typeIndex, idxGrantByEntitlementPrincipalHash}
+}
+
+func GrantByEntPrincHashUpperBound() []byte {
+	return upperBoundOf(GrantByEntPrincHashLowerBound())
+}
+
+// Digest node keys.
+//
+//	v3 | typeDigest | index_id(1 byte) | 0x00 | esc(partition) | 0x00 | level(1 byte) | bucket_prefix
+//
+// index_id discriminates WHICH digested index the node belongs to (the
+// digested index's own idx* byte, see digestIndexSpec) — it leads the
+// tail so all of a file's digests for every index are still a single
+// contiguous range for the cleanup/clone plans. The partition (which
+// for the grant digest contains bare 0x00 separators — see the
+// partition convention above) is tuple-ESCAPED here, unlike in the
+// index key: node keys carry a level byte and a raw bucket prefix after
+// it, so the partition must parse as a single ordinary tuple element.
+// The tuple escape is order-preserving, so node keys still sort in raw
+// partition order. level 0 is the root (bucket_prefix empty); level 1
+// is the single leaf level, one node per non-empty bucket, whose
+// bucket_prefix is the bucket index LEFT-ALIGNED in 2 raw bytes
+// (digestLeafPrefixLen). The left alignment makes leaf keys sort in
+// bucket-hash order at every digest width, so the comparison's
+// fold-to-coarser-width merge is a single contiguous scan of this
+// range. See digest.go for the node value framing.
+func encodeDigestNodeKey(indexID byte, partition string, level byte, bucketPrefix []byte) []byte {
+	buf := rawdb.DigestPartitionPrefix(indexID, partition)
+	buf = append(buf, level)
+	return append(buf, bucketPrefix...)
+}
+
+// DigestLowerBound / UpperBound bound the entire digest keyspace (all
+// digested indexes). Exported for the cleanup/clone/compaction keyspace
+// plans. typeDigest is NOT adjacent to typeIndex — typeCounter and
+// typeSession sit between them — so an excise span must never be
+// widened to cover both the hash index and the digests in one range.
+func DigestLowerBound() []byte {
+	return []byte{versionV3, typeDigest}
+}
+
+func DigestUpperBound() []byte {
+	return upperBoundOf(DigestLowerBound())
+}
+
 // --- ResourceType ---
 
 // encodeResourceTypeKey returns the primary key for a resource_type:
@@ -306,20 +383,6 @@ func encodeResourceKey(resourceTypeID, resourceID string) []byte {
 // encodeResourcePrefix is the by-type prefix for resources.
 func encodeResourcePrefix() []byte {
 	return []byte{versionV3, typeResource}
-}
-
-// encodeResourceByParentIndexKey: index of children-by-parent:
-//
-//	v3 | typeIndex | idxResourceByParent | 0x00 |
-//	    parent_rt | 0x00 | parent_id | 0x00 | child_rt | 0x00 | child_id
-//
-// Paired with encodeResourceByParentPrefix (by-value prefix, with
-// trailing sep).
-func encodeResourceByParentIndexKey(parentRT, parentID, childRT, childID string) []byte {
-	buf := make([]byte, 0, 64)
-	buf = append(buf, versionV3, typeIndex, idxResourceByParent)
-	buf = codec.AppendTupleSeparator(buf)
-	return codec.AppendTupleStrings(buf, parentRT, parentID, childRT, childID)
 }
 
 // encodeResourceByParentPrefix is the by-value prefix for "all

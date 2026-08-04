@@ -16,6 +16,11 @@ import (
 	"github.com/conductorone/baton-sdk/pkg/dotc1z/c1zstore"
 )
 
+// Compile-time assertion: *Adapter must satisfy the full
+// GrantsReaderServiceServer contract, which now includes
+// ListGrantsForPrincipal as a first-class required method.
+var _ reader_v2.GrantsReaderServiceServer = (*Adapter)(nil)
+
 // Reader gRPC service methods. The syncer (`pkg/sync/syncer.go`) and
 // the grant expander (`pkg/sync/expand/expander.go`) hard-depend on
 // these — without them the syncer can't run against the Pebble
@@ -27,15 +32,15 @@ import (
 
 // GetEntitlement fetches a single entitlement by ID. Implements
 // reader_v2.EntitlementsReaderServiceServer.
-func (a *Adapter) GetEntitlement(ctx context.Context, req *reader_v2.EntitlementsReaderServiceGetEntitlementRequest) (*reader_v2.EntitlementsReaderServiceGetEntitlementResponse, error) {
-	syncID, err := a.resolveActiveSyncForReader(ctx, req.GetAnnotations())
+func (e *Engine) GetEntitlement(ctx context.Context, req *reader_v2.EntitlementsReaderServiceGetEntitlementRequest) (*reader_v2.EntitlementsReaderServiceGetEntitlementResponse, error) {
+	syncID, err := e.resolveActiveSyncForReader(ctx, req.GetAnnotations())
 	if err != nil {
 		return nil, err
 	}
 	if syncID == "" {
 		return nil, ErrNoCurrentSync
 	}
-	rec, err := a.engine.GetEntitlementRecord(ctx, req.GetEntitlementId())
+	rec, err := e.GetEntitlementRecord(ctx, req.GetEntitlementId())
 	err = c1zstore.AdaptNotFound(err, pebble.ErrNotFound)
 	if err != nil {
 		return nil, err
@@ -47,8 +52,8 @@ func (a *Adapter) GetEntitlement(ctx context.Context, req *reader_v2.Entitlement
 
 // GetResource fetches a single resource by (resource_type_id,
 // resource_id). Implements reader_v2.ResourcesReaderServiceServer.
-func (a *Adapter) GetResource(ctx context.Context, req *reader_v2.ResourcesReaderServiceGetResourceRequest) (*reader_v2.ResourcesReaderServiceGetResourceResponse, error) {
-	syncID, err := a.resolveActiveSyncForReader(ctx, req.GetAnnotations())
+func (e *Engine) GetResource(ctx context.Context, req *reader_v2.ResourcesReaderServiceGetResourceRequest) (*reader_v2.ResourcesReaderServiceGetResourceResponse, error) {
+	syncID, err := e.resolveActiveSyncForReader(ctx, req.GetAnnotations())
 	if err != nil {
 		return nil, err
 	}
@@ -59,7 +64,7 @@ func (a *Adapter) GetResource(ctx context.Context, req *reader_v2.ResourcesReade
 	if rid == nil {
 		return nil, errors.New("GetResource: nil resource_id")
 	}
-	rec, err := a.engine.GetResourceRecord(ctx, rid.GetResourceType(), rid.GetResource())
+	rec, err := e.GetResourceRecord(ctx, rid.GetResourceType(), rid.GetResource())
 	err = c1zstore.AdaptNotFound(err, pebble.ErrNotFound)
 	if err != nil {
 		return nil, err
@@ -71,15 +76,15 @@ func (a *Adapter) GetResource(ctx context.Context, req *reader_v2.ResourcesReade
 
 // GetResourceType fetches a single resource_type by ID. Implements
 // reader_v2.ResourceTypesReaderServiceServer.
-func (a *Adapter) GetResourceType(ctx context.Context, req *reader_v2.ResourceTypesReaderServiceGetResourceTypeRequest) (*reader_v2.ResourceTypesReaderServiceGetResourceTypeResponse, error) {
-	syncID, err := a.resolveActiveSyncForReader(ctx, req.GetAnnotations())
+func (e *Engine) GetResourceType(ctx context.Context, req *reader_v2.ResourceTypesReaderServiceGetResourceTypeRequest) (*reader_v2.ResourceTypesReaderServiceGetResourceTypeResponse, error) {
+	syncID, err := e.resolveActiveSyncForReader(ctx, req.GetAnnotations())
 	if err != nil {
 		return nil, err
 	}
 	if syncID == "" {
 		return nil, ErrNoCurrentSync
 	}
-	rec, err := a.engine.GetResourceTypeRecord(ctx, req.GetResourceTypeId())
+	rec, err := e.GetResourceTypeRecord(ctx, req.GetResourceTypeId())
 	err = c1zstore.AdaptNotFound(err, pebble.ErrNotFound)
 	if err != nil {
 		return nil, err
@@ -94,11 +99,11 @@ func (a *Adapter) GetResourceType(ctx context.Context, req *reader_v2.ResourceTy
 // omitted. Callers detect partial misses by length comparison.
 //
 //nolint:revive // method name mirrors the protobuf-generated gRPC server interface
-func (a *Adapter) ListResourcesByIds(
+func (e *Engine) ListResourcesByIds(
 	ctx context.Context,
 	req *reader_v2.ResourcesReaderServiceListResourcesByIdsRequest,
 ) (*reader_v2.ResourcesReaderServiceListResourcesByIdsResponse, error) {
-	syncID, err := a.resolveActiveSyncForReader(ctx, req.GetAnnotations())
+	syncID, err := e.resolveActiveSyncForReader(ctx, req.GetAnnotations())
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +119,7 @@ func (a *Adapter) ListResourcesByIds(
 		if id == nil {
 			continue
 		}
-		rec, err := a.engine.GetResourceRecord(ctx, id.GetResourceType(), id.GetResource())
+		rec, err := e.GetResourceRecord(ctx, id.GetResourceType(), id.GetResource())
 		if err != nil {
 			if errors.Is(err, pebble.ErrNotFound) {
 				continue
@@ -132,11 +137,11 @@ func (a *Adapter) ListResourcesByIds(
 // external_ids. Missing rows are silently omitted.
 //
 //nolint:revive // method name mirrors the protobuf-generated gRPC server interface
-func (a *Adapter) ListEntitlementsByIds(
+func (e *Engine) ListEntitlementsByIds(
 	ctx context.Context,
 	req *reader_v2.EntitlementsReaderServiceListEntitlementsByIdsRequest,
 ) (*reader_v2.EntitlementsReaderServiceListEntitlementsByIdsResponse, error) {
-	syncID, err := a.resolveActiveSyncForReader(ctx, req.GetAnnotations())
+	syncID, err := e.resolveActiveSyncForReader(ctx, req.GetAnnotations())
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +157,7 @@ func (a *Adapter) ListEntitlementsByIds(
 		if id == "" {
 			continue
 		}
-		rec, err := a.engine.GetEntitlementRecord(ctx, id)
+		rec, err := e.GetEntitlementRecord(ctx, id)
 		if err != nil {
 			if errors.Is(err, pebble.ErrNotFound) {
 				continue
@@ -175,17 +180,17 @@ func (a *Adapter) ListEntitlementsByIds(
 // streamingPrincipalGroupStream additionally fails loudly if the order
 // invariant is ever violated, and the differential/parity suites compare
 // the sorted and unsorted evaluators against SQLite.
-func (a *Adapter) GrantsForEntitlementPrincipalSorted() bool { return true }
+func (e *Engine) GrantsForEntitlementPrincipalSorted() bool { return true }
 
 // ListGrantsForEntitlement paginates grants on a specific
 // entitlement, optionally narrowed by principal_id or
 // principal_resource_type_ids. Implements
 // reader_v2.GrantsReaderServiceServer.
-func (a *Adapter) ListGrantsForEntitlement(
+func (e *Engine) ListGrantsForEntitlement(
 	ctx context.Context,
 	req *reader_v2.GrantsReaderServiceListGrantsForEntitlementRequest,
 ) (*reader_v2.GrantsReaderServiceListGrantsForEntitlementResponse, error) {
-	syncID, err := a.resolveActiveSyncForReader(ctx, req.GetAnnotations())
+	syncID, err := e.resolveActiveSyncForReader(ctx, req.GetAnnotations())
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +201,7 @@ func (a *Adapter) ListGrantsForEntitlement(
 	if ent == nil || ent.GetId() == "" {
 		return nil, errors.New("ListGrantsForEntitlement: missing entitlement id")
 	}
-	entIdentity, err := a.entitlementIdentityForRequest(ctx, ent)
+	entIdentity, err := e.entitlementIdentityForRequest(ctx, ent)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
 			// Unknown entitlement → no grants, matching the legacy
@@ -221,12 +226,12 @@ func (a *Adapter) ListGrantsForEntitlement(
 	// needed because a post-filter break at len(out) == limit may
 	// leave matching records unconsumed in the engine page, and
 	// the engine's end-of-page cursor would skip them.
-	cursorFor := func(rec *v3.GrantRecord) string {
+	cursorFor := func(rec *v3.GrantRecord) (string, error) {
 		id, err := grantIdentityFromRecord(rec)
 		if err != nil {
-			return ""
+			return "", err
 		}
-		return encodeCursor(encodeGrantIdentityKey(id))
+		return encodeCursor(encodeGrantIdentityKey(id)), nil
 	}
 
 	out := make([]*v2.Grant, 0, limit)
@@ -243,10 +248,10 @@ func (a *Adapter) ListGrantsForEntitlement(
 		var records []*v3.GrantRecord
 		var next string
 		if principalID != nil {
-			records, next, err = a.engine.PaginateGrantsByEntitlementPrincipal(ctx,
+			records, next, err = e.PaginateGrantsByEntitlementPrincipal(ctx,
 				entIdentity, principalID.GetResourceType(), principalID.GetResource(), cursor, fetchLimit)
 		} else {
-			records, next, err = a.engine.PaginateGrantsByEntitlement(ctx,
+			records, next, err = e.PaginateGrantsByEntitlement(ctx,
 				entIdentity, cursor, fetchLimit)
 		}
 		if err != nil {
@@ -269,7 +274,10 @@ func (a *Adapter) ListGrantsForEntitlement(
 			}
 			out = append(out, V3GrantToV2(rec))
 			if len(out) == limit {
-				nextCursor = cursorFor(rec)
+				nextCursor, err = cursorFor(rec)
+				if err != nil {
+					return nil, err
+				}
 				brokeEarly = true
 				break
 			}
@@ -292,13 +300,13 @@ func (a *Adapter) ListGrantsForEntitlement(
 // by grant expansion prefetch. It avoids materializing full grant records when
 // the caller only needs to know which principals already have a descendant
 // entitlement grant.
-func (a *Adapter) ListGrantPrincipalKeysForEntitlement(
+func (e *Engine) ListGrantPrincipalKeysForEntitlement(
 	ctx context.Context,
 	entitlement *v2.Entitlement,
 	pageToken string,
 	pageSize uint32,
 ) ([]string, string, error) {
-	syncID, err := a.resolveActiveSyncForReader(ctx, nil)
+	syncID, err := e.resolveActiveSyncForReader(ctx, nil)
 	if err != nil {
 		return nil, "", err
 	}
@@ -308,14 +316,14 @@ func (a *Adapter) ListGrantPrincipalKeysForEntitlement(
 	if entitlement == nil || entitlement.GetId() == "" {
 		return nil, "", errors.New("ListGrantPrincipalKeysForEntitlement: missing entitlement id")
 	}
-	entIdentity, err := a.entitlementIdentityForRequest(ctx, entitlement)
+	entIdentity, err := e.entitlementIdentityForRequest(ctx, entitlement)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
 			return nil, "", nil
 		}
 		return nil, "", err
 	}
-	keys, next, err := a.engine.PaginateGrantPrincipalKeysByEntitlement(ctx, entIdentity, pageToken, clampPageSize(pageSize))
+	keys, next, err := e.PaginateGrantPrincipalKeysByEntitlement(ctx, entIdentity, pageToken, clampPageSize(pageSize))
 	if err != nil {
 		return nil, "", c1zstore.AdaptNotFound(err, pebble.ErrNotFound)
 	}
@@ -328,60 +336,69 @@ func (a *Adapter) ListGrantPrincipalKeysForEntitlement(
 // exactly from structured parts; otherwise the raw id string resolves
 // through the bare-id lookup (exactly-one rule; pebble.ErrNotFound when the
 // id matches nothing).
-func (a *Adapter) entitlementIdentityForRequest(ctx context.Context, ent *v2.Entitlement) (entitlementIdentity, error) {
+func (e *Engine) entitlementIdentityForRequest(ctx context.Context, ent *v2.Entitlement) (entitlementIdentity, error) {
 	if ent == nil || ent.GetId() == "" {
 		return entitlementIdentity{}, errors.New("missing entitlement id")
 	}
 	if res := ent.GetResource(); res.GetId().GetResourceType() != "" && res.GetId().GetResource() != "" {
 		return entitlementIdentityFromParts(res.GetId().GetResourceType(), res.GetId().GetResource(), ent.GetId()), nil
 	}
-	return a.engine.resolveGrantScanEntitlementIdentity(ctx, ent.GetId())
+	return e.resolveGrantScanEntitlementIdentity(ctx, ent.GetId())
 }
 
-// ListGrantsForPrincipal is the Go-level convenience method that
-// matches C1File.ListGrantsForPrincipal. It is NOT a gRPC RPC —
-// the explorer / cel-search consumers reach C1File directly today.
-// Adapter exposes the same shape for callers that take a typed
-// store (refactor to a shared interface is tracked separately).
-//
-// Semantically equivalent to ListGrantsForEntitlement(req) where
-// the request carries a principal filter — the underlying
-// PaginateGrantsByPrincipal index walk is what makes this O(K).
-func (a *Adapter) ListGrantsForPrincipal(
+// ListGrantsForPrincipal returns all grants where the given principal_id is
+// the principal, via the O(K) PaginateGrantsByPrincipal index walk. The
+// optional Entitlement field narrows results to a single entitlement — since
+// entitlement + principal is the full primary grant key, that case is an O(1)
+// point lookup. Implements reader_v2.GrantsReaderServiceServer.
+func (e *Engine) ListGrantsForPrincipal(
 	ctx context.Context,
-	req *reader_v2.GrantsReaderServiceListGrantsForEntitlementRequest,
-) (*reader_v2.GrantsReaderServiceListGrantsForEntitlementResponse, error) {
-	syncID, err := a.resolveActiveSyncForReader(ctx, req.GetAnnotations())
+	req *reader_v2.GrantsReaderServiceListGrantsForPrincipalRequest,
+) (*reader_v2.GrantsReaderServiceListGrantsForPrincipalResponse, error) {
+	syncID, err := e.resolveActiveSyncForReader(ctx, req.GetAnnotations())
 	if err != nil {
 		return nil, err
 	}
 	if syncID == "" {
 		return nil, ErrNoCurrentSync
 	}
-	principal := req.GetPrincipalId() //nolint:staticcheck // ignore deprecated field
+	principal := req.GetPrincipalId()
 	if principal == nil || principal.GetResource() == "" {
 		return nil, errors.New("ListGrantsForPrincipal: missing principal_id")
 	}
 	limit := clampPageSize(req.GetPageSize())
 	cursor := req.GetPageToken()
-	records, next, err := a.engine.PaginateGrantsByPrincipal(ctx,
-		principal.GetResourceType(), principal.GetResource(), cursor, limit)
-	if err != nil {
-		return nil, c1zstore.AdaptNotFound(err, pebble.ErrNotFound)
+	var records []*v3.GrantRecord
+	var next string
+	if ent := req.GetEntitlement(); ent != nil && ent.GetId() != "" {
+		// Entitlement + principal is the full primary grant key, so this
+		// is a point lookup rather than a filtered by_principal scan.
+		entIdentity, err := e.entitlementIdentityForRequest(ctx, ent)
+		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				// Unknown entitlement → no grants, matching the legacy
+				// post-filter semantics.
+				return reader_v2.GrantsReaderServiceListGrantsForPrincipalResponse_builder{}.Build(), nil
+			}
+			return nil, err
+		}
+		records, next, err = e.PaginateGrantsByEntitlementPrincipal(ctx,
+			entIdentity, principal.GetResourceType(), principal.GetResource(), cursor, limit)
+		if err != nil {
+			return nil, c1zstore.AdaptNotFound(err, pebble.ErrNotFound)
+		}
+	} else {
+		records, next, err = e.PaginateGrantsByPrincipal(ctx,
+			principal.GetResourceType(), principal.GetResource(), cursor, limit)
+		if err != nil {
+			return nil, c1zstore.AdaptNotFound(err, pebble.ErrNotFound)
+		}
 	}
 	out := make([]*v2.Grant, 0, len(records))
 	for _, rec := range records {
-		// Optional entitlement filter — narrows the principal scan
-		// to a single entitlement when the caller passes one. Raw string
-		// equality: refs and request ids are the same connector strings.
-		if ent := req.GetEntitlement(); ent != nil && ent.GetId() != "" {
-			if rec.GetEntitlement().GetEntitlementId() != ent.GetId() {
-				continue
-			}
-		}
 		out = append(out, V3GrantToV2(rec))
 	}
-	return reader_v2.GrantsReaderServiceListGrantsForEntitlementResponse_builder{
+	return reader_v2.GrantsReaderServiceListGrantsForPrincipalResponse_builder{
 		List:          out,
 		NextPageToken: next,
 	}.Build(), nil
@@ -392,11 +409,11 @@ func (a *Adapter) ListGrantsForPrincipal(
 // The cursor is the by_principal index key.
 //
 // Implements reader_v2.GrantsReaderServiceServer.
-func (a *Adapter) ListGrantsForResourceType(
+func (e *Engine) ListGrantsForResourceType(
 	ctx context.Context,
 	req *reader_v2.GrantsReaderServiceListGrantsForResourceTypeRequest,
 ) (*reader_v2.GrantsReaderServiceListGrantsForResourceTypeResponse, error) {
-	syncID, err := a.resolveActiveSyncForReader(ctx, req.GetAnnotations())
+	syncID, err := e.resolveActiveSyncForReader(ctx, req.GetAnnotations())
 	if err != nil {
 		return nil, err
 	}
@@ -409,7 +426,7 @@ func (a *Adapter) ListGrantsForResourceType(
 	}
 	limit := clampPageSize(req.GetPageSize())
 	cursor := req.GetPageToken()
-	records, next, err := a.engine.PaginateGrantsByPrincipalResourceType(ctx, rtFilter, cursor, limit)
+	records, next, err := e.PaginateGrantsByPrincipalResourceType(ctx, rtFilter, cursor, limit)
 	if err != nil {
 		return nil, c1zstore.AdaptNotFound(err, pebble.ErrNotFound)
 	}
@@ -425,27 +442,18 @@ func (a *Adapter) ListGrantsForResourceType(
 
 // GetSync fetches a single sync_run record by ID. Implements
 // reader_v2.SyncsReaderServiceServer.
-func (a *Adapter) GetSync(ctx context.Context, req *reader_v2.SyncsReaderServiceGetSyncRequest) (*reader_v2.SyncsReaderServiceGetSyncResponse, error) {
+func (e *Engine) GetSync(ctx context.Context, req *reader_v2.SyncsReaderServiceGetSyncRequest) (*reader_v2.SyncsReaderServiceGetSyncResponse, error) {
 	if req.GetSyncId() == "" {
 		return nil, errors.New("GetSync: empty sync_id")
 	}
-	rec, err := a.engine.GetSyncRunRecord(ctx, req.GetSyncId())
+	rec, err := e.GetSyncRunRecord(ctx, req.GetSyncId())
 	if err != nil {
 		return nil, c1zstore.AdaptNotFound(err, pebble.ErrNotFound)
 	}
 
-	stats, _, err := CachedSyncStats(ctx, a.engine, req.GetSyncId())
+	stats, err := e.syncStatsForRun(ctx, rec)
 	if err != nil {
-		return nil, c1zstore.AdaptNotFound(err, pebble.ErrNotFound)
-	}
-
-	if stats == nil {
-		computedStats, err := a.engine.computeSyncStats(ctx, req.GetSyncId())
-		if err != nil {
-			return nil, c1zstore.AdaptNotFound(err, pebble.ErrNotFound)
-		}
-
-		stats = SyncStatsFromRecord(computedStats)
+		return nil, err
 	}
 
 	return reader_v2.SyncsReaderServiceGetSyncResponse_builder{
@@ -457,7 +465,7 @@ func (a *Adapter) GetSync(ctx context.Context, req *reader_v2.SyncsReaderService
 // the natural sync_id (KSUID) order — KSUIDs sort by timestamp, so
 // this is also chronological. Implements
 // reader_v2.SyncsReaderServiceServer.
-func (a *Adapter) ListSyncs(ctx context.Context, req *reader_v2.SyncsReaderServiceListSyncsRequest) (*reader_v2.SyncsReaderServiceListSyncsResponse, error) {
+func (e *Engine) ListSyncs(ctx context.Context, req *reader_v2.SyncsReaderServiceListSyncsRequest) (*reader_v2.SyncsReaderServiceListSyncsResponse, error) {
 	limit := clampPageSize(req.GetPageSize())
 	cursorBytes, err := decodeCursor(req.GetPageToken())
 	if err != nil {
@@ -468,7 +476,7 @@ func (a *Adapter) ListSyncs(ctx context.Context, req *reader_v2.SyncsReaderServi
 	if err != nil {
 		return nil, err
 	}
-	iter, err := a.engine.DB().NewIter(&pebble.IterOptions{
+	iter, err := e.NewIter(&pebble.IterOptions{
 		LowerBound: lower,
 		UpperBound: upper,
 	})
@@ -493,7 +501,7 @@ func (a *Adapter) ListSyncs(ctx context.Context, req *reader_v2.SyncsReaderServi
 		}
 		lastKey = append(lastKey[:0], iter.Key()...)
 
-		stats, _, err := CachedSyncStats(ctx, a.engine, r.GetSyncId())
+		stats, err := e.syncStatsForRun(ctx, r)
 		if err != nil {
 			return nil, err
 		}
@@ -521,8 +529,8 @@ func (a *Adapter) ListSyncs(ctx context.Context, req *reader_v2.SyncsReaderServi
 // Future work: if this becomes hot, a "latest by type" sidecar key
 // keyed on (typeFinishedSyncByType | type) → sync_id would let
 // Engine.LatestFinishedSyncRecord short-circuit to O(1).
-func (a *Adapter) GetLatestFinishedSync(ctx context.Context, req *reader_v2.SyncsReaderServiceGetLatestFinishedSyncRequest) (*reader_v2.SyncsReaderServiceGetLatestFinishedSyncResponse, error) {
-	latest, err := a.engine.LatestFinishedSyncRecord(ctx, syncTypeFilterFromString(req.GetSyncType()))
+func (e *Engine) GetLatestFinishedSync(ctx context.Context, req *reader_v2.SyncsReaderServiceGetLatestFinishedSyncRequest) (*reader_v2.SyncsReaderServiceGetLatestFinishedSyncResponse, error) {
+	latest, err := e.LatestFinishedSyncRecord(ctx, syncTypeFilterFromString(req.GetSyncType()))
 	if err != nil {
 		return nil, err
 	}
@@ -530,23 +538,36 @@ func (a *Adapter) GetLatestFinishedSync(ctx context.Context, req *reader_v2.Sync
 		return reader_v2.SyncsReaderServiceGetLatestFinishedSyncResponse_builder{}.Build(), nil
 	}
 
-	stats, _, err := CachedSyncStats(ctx, a.engine, latest.GetSyncId())
+	stats, err := e.syncStatsForRun(ctx, latest)
 	if err != nil {
-		return reader_v2.SyncsReaderServiceGetLatestFinishedSyncResponse_builder{}.Build(), err
-	}
-
-	if stats == nil {
-		computedStats, err := a.engine.computeSyncStats(ctx, latest.GetSyncId())
-		if err != nil {
-			return nil, c1zstore.AdaptNotFound(err, pebble.ErrNotFound)
-		}
-
-		stats = SyncStatsFromRecord(computedStats)
+		return nil, err
 	}
 
 	return reader_v2.SyncsReaderServiceGetLatestFinishedSyncResponse_builder{
 		Sync: v3SyncRunToV2(latest, stats),
 	}.Build(), nil
+}
+
+// syncStatsForRun returns SyncStats for a sync_run, preferring the
+// sidecar and falling back to computeSyncStats. Token timings are
+// present only when EndSync persisted them into the sidecar; older
+// count-only caches and iteration fallbacks return counts alone.
+func (e *Engine) syncStatsForRun(ctx context.Context, rec *v3.SyncRunRecord) (*reader_v2.SyncStats, error) {
+	if rec == nil {
+		return nil, nil
+	}
+	stats, _, err := CachedSyncStats(ctx, e, rec.GetSyncId())
+	if err != nil {
+		return nil, c1zstore.AdaptNotFound(err, pebble.ErrNotFound)
+	}
+	if stats != nil {
+		return stats, nil
+	}
+	computedStats, err := e.computeSyncStats(ctx, rec.GetSyncId())
+	if err != nil {
+		return nil, c1zstore.AdaptNotFound(err, pebble.ErrNotFound)
+	}
+	return SyncStatsFromRecord(computedStats), nil
 }
 
 // syncTypeFilterFromString returns a predicate that matches sync_runs
@@ -605,7 +626,7 @@ func v3SyncTypeToString(t v3.SyncType) string {
 // lookups, surfaces as a non-nil error so callers don't silently fall
 // through to the wrong sync (matching SQLite's resolveSyncIDForRead,
 // which propagates those errors rather than swallowing them).
-func (a *Adapter) resolveActiveSyncForReader(ctx context.Context, annos []*anypb.Any) (string, error) {
+func (e *Engine) resolveActiveSyncForReader(ctx context.Context, annos []*anypb.Any) (string, error) {
 	annoSyncID, err := sdkannotations.GetSyncIdFromAnnotations(annos)
 	if err != nil {
 		return "", fmt.Errorf("pebble: read sync_id from annotations: %w", err)
@@ -613,10 +634,10 @@ func (a *Adapter) resolveActiveSyncForReader(ctx context.Context, annos []*anypb
 	if annoSyncID != "" {
 		return annoSyncID, nil
 	}
-	if id := a.currentSyncID(); id != "" {
+	if id := e.CurrentSyncID(); id != "" {
 		return id, nil
 	}
-	id, err := a.LatestFinishedSyncID(ctx, connectorstore.SyncTypeAny)
+	id, err := e.LatestFinishedSyncID(ctx, connectorstore.SyncTypeAny)
 	if err != nil {
 		return "", fmt.Errorf("pebble: latest finished sync: %w", err)
 	}
@@ -627,7 +648,7 @@ func (a *Adapter) resolveActiveSyncForReader(ctx context.Context, annos []*anypb
 	// latest in-progress sync (started within the last week). Lets
 	// reads against a c1z whose only sync was interrupted before
 	// EndSync resolve to that sync instead of ErrNoCurrentSync.
-	rec, err := a.engine.LatestUnfinishedSyncRecord(ctx, nil)
+	rec, err := e.LatestUnfinishedSyncRecord(ctx, nil)
 	if err != nil {
 		return "", fmt.Errorf("pebble: latest unfinished sync: %w", err)
 	}
@@ -637,13 +658,143 @@ func (a *Adapter) resolveActiveSyncForReader(ctx context.Context, annos []*anypb
 	return "", nil
 }
 
-func (a *Adapter) InitCurrentSync(ctx context.Context) error {
-	id, err := a.resolveActiveSyncForReader(ctx, nil)
+func (e *Engine) InitCurrentSync(ctx context.Context) error {
+	id, err := e.resolveActiveSyncForReader(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("pebble: error resolving active sync: %w", err)
 	}
 	if id != "" {
-		return a.SetCurrentSync(ctx, id)
+		return e.SetCurrentSync(ctx, id)
 	}
 	return nil
+}
+
+// digestEntitlementIdentity maps a request-supplied entitlement stub to
+// the structural identity the digest keyspace is addressed by, via the
+// same entitlementIdentityForRequest the grants-for-entitlement readers
+// use: exact derivation from the resource ref when present, bare-id
+// resolution (exactly-one rule) otherwise. ok is false when a bare id
+// matches nothing; an AMBIGUOUS id stays an error — a lossy string must
+// never guess which digest to answer with. A nil stub or empty Id is an
+// error, matching ListGrantsForEntitlement.
+func (e *Engine) digestEntitlementIdentity(ctx context.Context, ent *v2.Entitlement) (entitlementIdentity, bool, error) {
+	id, err := e.entitlementIdentityForRequest(ctx, ent)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return entitlementIdentity{}, false, nil
+		}
+		return entitlementIdentity{}, false, err
+	}
+	return id, true, nil
+}
+
+// GetEntitlementGrantDigest implements connectorstore.EntitlementGrantDigestReader.
+// It returns the stored grant-digest root (content hash + grant count)
+// for the entitlement under the reader's active sync. found is false
+// when no digest exists — either no active sync, an unknown bare id, or
+// no digest was built for it (e.g. WithGrantDigestIndex(false), a file
+// that predates the digest, or a post-seal mutation invalidated it). A
+// nil error with found=false means "no digest".
+func (e *Engine) GetEntitlementGrantDigest(ctx context.Context, ent *v2.Entitlement) (connectorstore.GrantDigest, bool, error) {
+	syncID, err := e.resolveActiveSyncForReader(ctx, nil)
+	if err != nil {
+		return connectorstore.GrantDigest{}, false, err
+	}
+	if syncID == "" {
+		return connectorstore.GrantDigest{}, false, nil
+	}
+	id, ok, err := e.digestEntitlementIdentity(ctx, ent)
+	if err != nil || !ok {
+		return connectorstore.GrantDigest{}, false, err
+	}
+	root, ok, err := e.GetEntitlementDigestRoot(ctx, id)
+	if err != nil || !ok {
+		return connectorstore.GrantDigest{}, false, err
+	}
+	return connectorstore.GrantDigest{Hash: root.Hash, Count: root.Count, Level: root.Bits}, true, nil
+}
+
+// GetEntitlementGrantDigestNodes implements
+// connectorstore.EntitlementGrantDigestReader. It lists the entitlement's
+// grant-digest rollup nodes at the requested level (2^level buckets;
+// level 0 = the root). For 0 <= level <= the digest's native level it
+// folds the stored leaves — one scan of the digest keyspace. For a finer
+// level it scans the grant index directly (O(grants)) instead of
+// erroring; the level is clamped to the bucket-hash resolution
+// (digestMaxWidthBits).
+func (e *Engine) GetEntitlementGrantDigestNodes(ctx context.Context, ent *v2.Entitlement, level int) ([]connectorstore.GrantDigestNode, bool, error) {
+	if level < 0 {
+		return nil, false, fmt.Errorf("pebble: negative grant-digest level %d", level)
+	}
+	syncID, err := e.resolveActiveSyncForReader(ctx, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	if syncID == "" {
+		return nil, false, nil
+	}
+	id, ok, err := e.digestEntitlementIdentity(ctx, ent)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	root, ok, err := e.GetEntitlementDigestRoot(ctx, id)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	// Level 0 is the whole-entitlement root — return it directly (covers
+	// the root-only digest, which has no stored leaves to fold).
+	if level == 0 {
+		return []connectorstore.GrantDigestNode{{Index: 0, Hash: root.Hash, Count: root.Count}}, true, nil
+	}
+	// The bucket hash carries at most digestMaxWidthBits of resolution;
+	// a finer level can't address more buckets, so clamp.
+	bits := min(level, digestMaxWidthBits)
+	// At or below the stored width, fold the digest leaves (cheap). Finer
+	// than what we stored, scan the grant index to compute the rollup.
+	partition := digestPartitionForEntitlement(id)
+	var folded []foldedBucket
+	if bits <= root.Bits {
+		folded, err = e.foldedLeafBuckets(ctx, grantDigestSpec, partition, bits)
+	} else {
+		folded, err = e.computeBucketsAtWidth(ctx, grantDigestSpec, partition, bits)
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	nodes := make([]connectorstore.GrantDigestNode, len(folded))
+	for i := range folded {
+		nodes[i] = connectorstore.GrantDigestNode{
+			Index: folded[i].idx,
+			Hash:  append([]byte(nil), folded[i].digest[:]...),
+			Count: folded[i].count,
+		}
+	}
+	return nodes, true, nil
+}
+
+// ScanEntitlementGrantBucket implements
+// connectorstore.EntitlementGrantDigestReader. It yields every grant in
+// the given digest bucket of the entitlement, translated to v2.Grant.
+// Bucket Level 0 scans the whole entitlement; a finer Level is clamped
+// to the bucket-hash resolution. Yields nothing when there is no active
+// sync or a bare entitlement id resolves to nothing.
+func (e *Engine) ScanEntitlementGrantBucket(ctx context.Context, ent *v2.Entitlement, bucket connectorstore.GrantDigestBucket, yield func(*v2.Grant) bool) error {
+	if bucket.Level < 0 {
+		return fmt.Errorf("pebble: negative grant-digest level %d", bucket.Level)
+	}
+	syncID, err := e.resolveActiveSyncForReader(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if syncID == "" {
+		return nil
+	}
+	id, ok, err := e.digestEntitlementIdentity(ctx, ent)
+	if err != nil || !ok {
+		return err
+	}
+	bits := min(bucket.Level, digestMaxWidthBits)
+	return e.IterateGrantsByEntitlementBucket(ctx, id, DigestBucket{Index: bucket.Index, Bits: bits}, func(r *v3.GrantRecord) bool {
+		return yield(V3GrantToV2(r))
+	})
 }

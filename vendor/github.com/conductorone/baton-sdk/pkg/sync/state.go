@@ -3,9 +3,12 @@ package sync //nolint:revive,nolintlint // we can't change the package name for 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
+	"sort"
 	"sync"
+	"time"
 
 	"github.com/conductorone/baton-sdk/pkg/sync/expand"
 
@@ -15,6 +18,16 @@ import (
 
 // If you make a breaking change to the state token, you must increment this version.
 const StateTokenVersion = 1
+
+// StateTokenVersionTypeScoped marks checkpoints whose action state carries
+// type-scoped or spawned-cursor markers. Older SDKs cannot interpret those
+// actions: their JSON parser silently drops the marker fields, and the
+// resulting actions dead-end against store pagination, sealing the sync as
+// complete while missing every pending cursor's data. Version 2 defeats
+// that: an older SDK fails the version check, falls back to the V0 parser,
+// gets an empty action state, and restarts collection from Init inside the
+// same sync run — redone work instead of silent data loss.
+const StateTokenVersionTypeScoped = 2
 
 type State interface {
 	PushAction(ctx context.Context, action Action)
@@ -38,28 +51,16 @@ type State interface {
 	ShouldSkipGrants() bool
 	SetShouldSkipGrants()
 	GetCompletedActionsCount() uint64
-	// CheckAndSetExclusionGroupResourceType records that exclusionGroupID is
-	// used on resourceTypeID. If the group was already recorded against a
-	// different resource type, the prior value is returned with conflict=true
-	// and the map is not modified. Otherwise the map is updated (if needed)
-	// and ("", false) is returned. The existing return value is meaningful
-	// only when conflict is true.
-	CheckAndSetExclusionGroupResourceType(exclusionGroupID, resourceTypeID string) (existing string, conflict bool)
-	// CheckAndSetExclusionGroupDefault records that entitlementID is the
-	// default entitlement for exclusionGroupID. If the group already has a
-	// recorded default that is not entitlementID, the prior value is returned
-	// with conflict=true and the map is not modified. Otherwise the map is
-	// updated (if needed) and ("", false) is returned. The existing return
-	// value is meaningful only when conflict is true.
-	CheckAndSetExclusionGroupDefault(exclusionGroupID, entitlementID string) (existing string, conflict bool)
-	// IncrementExclusionGroupCount increments the running count of entitlements
-	// observed for exclusionGroupID and returns the new count. The count is
-	// global per exclusion group id (across all resources) and survives resume.
-	IncrementExclusionGroupCount(exclusionGroupID string) uint32
-	// ClearExclusionGroupTracking drops the exclusion group bookkeeping maps so
-	// they don't bloat the token of a completed sync, mirroring
-	// ClearEntitlementGraph.
-	ClearExclusionGroupTracking(ctx context.Context)
+	AddStepDuration(bucket string, duration time.Duration)
+	StepDurations() map[string]int64
+	RecordConnectorCall(method string, duration time.Duration)
+	MergeConnectorCallStat(method string, add ConnectorCallStat)
+	ConnectorCallStats() map[string]ConnectorCallStat
+	RecordSessionOp(op string, duration time.Duration, opErr error, timedOut bool)
+	MergeSessionStat(op string, add SessionStoreStat)
+	SessionStoreStats() map[string]SessionStoreStat
+	SetIngestQuality(quality *IngestQualityCheckpoint)
+	IngestQuality() *IngestQualityCheckpoint
 }
 
 func NeedsExpansion(stateStr string) (bool, error) {
@@ -202,6 +203,19 @@ type Action struct {
 	ResourceID           string   `json:"resource_id,omitempty"`
 	ParentResourceTypeID string   `json:"parent_resource_type_id,omitempty"`
 	ParentResourceID     string   `json:"parent_resource_id,omitempty"`
+	// Spawned marks a sibling cursor enqueued by EnqueuePageTokens.
+	// Progress accounting counts only the origin action for per-resource
+	// phases. The marker is checkpointed so resume preserves that rule.
+	Spawned bool `json:"spawned,omitempty"`
+	// TypeScoped distinguishes whole-type grant/entitlement cursors from
+	// per-resource actions. Do not infer this from an empty ResourceID:
+	// malformed connector resources with empty ids can exist in old stores
+	// and must retain the pre-type-scoped per-resource behavior.
+	TypeScoped bool `json:"type_scoped,omitempty"`
+	// TypeScopedPlanned records that a root entitlement/grant action has
+	// already scheduled whole-type collection. Legacy checkpoints omit it,
+	// causing an upgraded syncer to plan type-scoped work once on resume.
+	TypeScopedPlanned bool `json:"type_scoped_planned,omitempty"`
 }
 
 var _ State = &state{}
@@ -219,9 +233,77 @@ type state struct {
 	shouldSkipEntitlementsAndGrants bool
 	shouldSkipGrants                bool
 	completedActionsCount           uint64
-	exclusionGroupResourceTypes     map[string]string
-	exclusionGroupDefaults          map[string]string
-	exclusionGroupCounts            map[string]uint32
+	stepDurationsMs                 map[string]int64
+	connectorCallStats              map[string]*ConnectorCallStat
+	sessionStoreStats               map[string]*SessionStoreStat
+	ingestQuality                   *IngestQualityCheckpoint
+	// compaction is provenance written by the sync compactor via
+	// BuildCompactedToken; the syncer itself never sets it. Kept on the
+	// state so Unmarshal→Marshal round trips (e.g. expansion replay
+	// tokens) preserve it.
+	compaction *CompactionTokenStats
+	// spawnedInFlight is the evidence set behind ingest invariant I10:
+	// every spawned sibling cursor (EnqueuePageTokens) admitted to the
+	// stack, keyed by action ID, removed only by the two legitimate
+	// completion paths (FinishAction and transitionAction's finish
+	// branch). A silent drop — any code path that loses an admitted
+	// action without finishing it — leaves its entry behind, and the
+	// invariant pass names it at sync quiesce. Unmarshal rebuilds the
+	// set from the checkpointed actions, so the evidence survives
+	// resume: a restored spawned cursor must still drain in the process
+	// that completes the sync. Guarded by st.mtx; bounded by the number
+	// of in-flight spawned actions (entries are deleted on finish).
+	spawnedInFlight map[string]Action
+	// spawnedAdmitted maps the identity digest (op, resource type,
+	// resource, page token, type-scope) of every spawned cursor admitted
+	// in THIS PROCESS to its action ID. It is the termination and
+	// idempotency guard for re-mentioned spawns: connectors legitimately
+	// re-mention a cursor another response already spawned (DAG-shaped
+	// shard discovery, or post-crash answers that shifted under a
+	// resumed checkpoint). The parallel queue's own dedup set is scoped
+	// to ONE batch, so an identity that completed in an earlier batch is
+	// invisible to it — without this process-lifetime set, two cursors
+	// mentioning each other across batch boundaries would re-admit each
+	// other forever. transitionAction skips a spawned child whose
+	// identity is already here. Entries are deliberately NEVER pruned on
+	// finish — a completed spawn must stay skippable or cycles resume.
+	// Not serialized: after a crash the set rebuilds from the surviving
+	// stack (Unmarshal), so a re-mention of work completed before the
+	// crash is redone once, idempotently, and the set re-accumulates —
+	// cycles still terminate. Guarded by st.mtx; bounded by total
+	// spawned admissions in the process (32-byte keys).
+	spawnedAdmitted map[parallelActionKey]string
+}
+
+// ConnectorCallStat contains cumulative latency statistics for one connector method.
+type ConnectorCallStat struct {
+	Count   int64 `json:"count"`
+	TotalMs int64 `json:"total_ms"`
+	MaxMs   int64 `json:"max_ms"`
+}
+
+// SessionStoreStat contains cumulative latency and outcome counters for one
+// session-store operation. Timeouts is the deadline-exceeded subset of
+// Errors; MaxMs pinned at a fixed value with Timeouts ≈ Count is the
+// signature of a backend whose every request times out.
+type SessionStoreStat struct {
+	Count    int64 `json:"count"`
+	Errors   int64 `json:"errors,omitempty"`
+	Timeouts int64 `json:"timeouts,omitempty"`
+	TotalMs  int64 `json:"total_ms"`
+	MaxMs    int64 `json:"max_ms"`
+}
+
+// IngestQualityCheckpoint is the checkpointed connector-ingestion quality
+// summary. A nil value means legacy/unknown provenance, not a clean sync.
+type IngestQualityCheckpoint struct {
+	SourceCacheReplayBlocked      bool   `json:"source_cache_replay_blocked,omitempty"`
+	EntitlementsDropped           uint64 `json:"entitlements_dropped,omitempty"`
+	GrantsDropped                 uint64 `json:"grants_dropped,omitempty"`
+	GrantResourcesDropped         uint64 `json:"grant_resources_dropped,omitempty"`
+	ExpansionResourceTypesDropped uint64 `json:"expansion_resource_types_dropped,omitempty"`
+	ExpansionsDropped             uint64 `json:"expansions_dropped,omitempty"`
+	ReasonFlags                   uint64 `json:"reason_flags,omitempty"`
 }
 
 // Original serialized token format. Needed to parse/resume syncs started by older versions of baton-sdk.
@@ -250,22 +332,31 @@ type serializedTokenV1 struct {
 	ShouldSkipEntitlementsAndGrants bool                     `json:"should_skip_entitlements_and_grants,omitempty"`
 	ShouldSkipGrants                bool                     `json:"should_skip_grants,omitempty"`
 	CompletedActionsCount           uint64                   `json:"completed_actions_count,omitempty"`
-	ExclusionGroupResourceTypes     map[string]string        `json:"exclusion_group_resource_types,omitempty"`
-	ExclusionGroupDefaults          map[string]string        `json:"exclusion_group_defaults,omitempty"`
-	ExclusionGroupCounts            map[string]uint32        `json:"exclusion_group_counts,omitempty"`
-	Version                         uint64                   `json:"version"`
+	// Exclusion-group tracking maps (exclusion_group_resource_types,
+	// exclusion_group_defaults, exclusion_group_counts) were removed
+	// when the streaming exclusion-group validation was replaced by
+	// ingestion invariant I5 over the stored keyspace: old tokens
+	// carrying them still parse (unknown JSON fields are ignored).
+	StepDurationsMs    map[string]int64              `json:"step_durations_ms,omitempty"`
+	ConnectorCallStats map[string]*ConnectorCallStat `json:"connector_call_stats,omitempty"`
+	SessionStoreStats  map[string]*SessionStoreStat  `json:"session_store_stats,omitempty"`
+	IngestQuality      *IngestQualityCheckpoint      `json:"ingest_quality,omitempty"`
+	Compaction         *CompactionTokenStats         `json:"compaction,omitempty"`
+	Version            uint64                        `json:"version"`
 }
 
 func newState() *state {
 	return &state{
-		actions:                     make(map[string]Action),
-		actionOrder:                 []string{},
-		currentActionID:             0,
-		entitlementGraph:            nil,
-		needsExpansion:              false,
-		exclusionGroupResourceTypes: make(map[string]string),
-		exclusionGroupDefaults:      make(map[string]string),
-		exclusionGroupCounts:        make(map[string]uint32),
+		actions:            make(map[string]Action),
+		actionOrder:        []string{},
+		currentActionID:    0,
+		entitlementGraph:   nil,
+		needsExpansion:     false,
+		stepDurationsMs:    make(map[string]int64),
+		connectorCallStats: make(map[string]*ConnectorCallStat),
+		sessionStoreStats:  make(map[string]*SessionStoreStat),
+		spawnedInFlight:    make(map[string]Action),
+		spawnedAdmitted:    make(map[parallelActionKey]string),
 	}
 }
 
@@ -366,7 +457,7 @@ func (st *state) Unmarshal(input string) error {
 
 	if input != "" {
 		err := json.Unmarshal([]byte(input), &token)
-		if err != nil || token.Version != StateTokenVersion {
+		if err != nil || (token.Version != StateTokenVersion && token.Version != StateTokenVersionTypeScoped) {
 			// Fall back to old serialized token format.
 			token, err = unmarshalTokenV0(input)
 			if err != nil {
@@ -390,17 +481,31 @@ func (st *state) Unmarshal(input string) error {
 		st.shouldSkipGrants = token.ShouldSkipGrants
 		st.shouldFetchRelatedResources = token.ShouldFetchRelatedResources
 		st.completedActionsCount = token.CompletedActionsCount
-		st.exclusionGroupResourceTypes = token.ExclusionGroupResourceTypes
-		if st.exclusionGroupResourceTypes == nil {
-			st.exclusionGroupResourceTypes = make(map[string]string)
+		st.stepDurationsMs = token.StepDurationsMs
+		if st.stepDurationsMs == nil {
+			st.stepDurationsMs = make(map[string]int64)
 		}
-		st.exclusionGroupDefaults = token.ExclusionGroupDefaults
-		if st.exclusionGroupDefaults == nil {
-			st.exclusionGroupDefaults = make(map[string]string)
+		st.connectorCallStats = token.ConnectorCallStats
+		if st.connectorCallStats == nil {
+			st.connectorCallStats = make(map[string]*ConnectorCallStat)
 		}
-		st.exclusionGroupCounts = token.ExclusionGroupCounts
-		if st.exclusionGroupCounts == nil {
-			st.exclusionGroupCounts = make(map[string]uint32)
+		st.sessionStoreStats = token.SessionStoreStats
+		if st.sessionStoreStats == nil {
+			st.sessionStoreStats = make(map[string]*SessionStoreStat)
+		}
+		st.ingestQuality = cloneIngestQualityCheckpoint(token.IngestQuality)
+		st.compaction = token.Compaction
+		// Rebuild the I10 drain-evidence set from the checkpointed
+		// actions: a spawned cursor restored from a token was admitted
+		// by a previous process and must still drain in the process
+		// that completes the sync. The re-mention guard set rebuilds
+		// from the same scan: only surviving identities are known —
+		// crash amnesia means completed spawns are re-doable, which is
+		// idempotent and re-accumulates the set.
+		st.spawnedInFlight = make(map[string]Action)
+		st.spawnedAdmitted = make(map[parallelActionKey]string)
+		for _, action := range st.actions {
+			st.recordSpawnedAdmissionLocked(action)
 		}
 	} else {
 		st.actions = make(map[string]Action)
@@ -415,18 +520,65 @@ func (st *state) Unmarshal(input string) error {
 		st.actions[actionID] = Action{Op: InitOp, ID: actionID}
 		st.actionOrder = append(st.actionOrder, actionID)
 		st.completedActionsCount = 0
-		st.exclusionGroupResourceTypes = make(map[string]string)
-		st.exclusionGroupDefaults = make(map[string]string)
-		st.exclusionGroupCounts = make(map[string]uint32)
+		st.stepDurationsMs = make(map[string]int64)
+		st.connectorCallStats = make(map[string]*ConnectorCallStat)
+		st.sessionStoreStats = make(map[string]*SessionStoreStat)
+		st.ingestQuality = nil
+		st.compaction = nil
+		st.spawnedInFlight = make(map[string]Action)
+		st.spawnedAdmitted = make(map[parallelActionKey]string)
 	}
 
 	return nil
+}
+
+// maxUndrainedTokenChars caps the page-token excerpt carried on I10
+// verdict lines (spawned tokens can be up to 1 MiB).
+const maxUndrainedTokenChars = 64
+
+// UndrainedSpawnedCursors describes every spawned cursor that was
+// admitted to the action stack but never completed through a legitimate
+// finish path — the I10 evidence read. Empty on a healthy state. Sorted
+// by action ID so verdicts are byte-stable.
+func (st *state) UndrainedSpawnedCursors() []string {
+	st.mtx.RLock()
+	defer st.mtx.RUnlock()
+	if len(st.spawnedInFlight) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(st.spawnedInFlight))
+	for id := range st.spawnedInFlight {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		action := st.spawnedInFlight[id]
+		token := action.PageToken
+		if len(token) > maxUndrainedTokenChars {
+			token = fmt.Sprintf("%s… (%d bytes)", token[:maxUndrainedTokenChars], len(action.PageToken))
+		}
+		out = append(out, fmt.Sprintf("action %s %s %s/%s token=%q",
+			id, action.Op.String(), action.ResourceTypeID, action.ResourceID, token))
+	}
+	return out
 }
 
 // Marshal returns a string encoding of the state object. This is useful for datastores to checkpoint the current state.
 func (st *state) Marshal() (string, error) {
 	st.mtx.RLock()
 	defer st.mtx.RUnlock()
+
+	// Stamp the type-scoped version only when the token actually carries
+	// markers an older parser would misinterpret; plain tokens keep
+	// version 1 so downgrades resume seamlessly.
+	version := uint64(StateTokenVersion)
+	for _, action := range st.actions {
+		if action.TypeScoped || action.Spawned || action.TypeScopedPlanned {
+			version = StateTokenVersionTypeScoped
+			break
+		}
+	}
 
 	data, err := json.Marshal(serializedTokenV1{
 		ActionsMap:                      st.actions,
@@ -439,10 +591,12 @@ func (st *state) Marshal() (string, error) {
 		ShouldSkipEntitlementsAndGrants: st.shouldSkipEntitlementsAndGrants,
 		ShouldSkipGrants:                st.shouldSkipGrants,
 		CompletedActionsCount:           st.completedActionsCount,
-		ExclusionGroupResourceTypes:     st.exclusionGroupResourceTypes,
-		ExclusionGroupDefaults:          st.exclusionGroupDefaults,
-		ExclusionGroupCounts:            st.exclusionGroupCounts,
-		Version:                         1,
+		StepDurationsMs:                 st.stepDurationsMs,
+		ConnectorCallStats:              st.connectorCallStats,
+		SessionStoreStats:               st.sessionStoreStats,
+		IngestQuality:                   cloneIngestQualityCheckpoint(st.ingestQuality),
+		Compaction:                      st.compaction,
+		Version:                         version,
 	})
 	if err != nil {
 		return "", err
@@ -451,12 +605,176 @@ func (st *state) Marshal() (string, error) {
 	return string(data), nil
 }
 
+func (st *state) AddStepDuration(bucket string, duration time.Duration) {
+	st.mtx.Lock()
+	defer st.mtx.Unlock()
+
+	if st.stepDurationsMs == nil {
+		st.stepDurationsMs = make(map[string]int64)
+	}
+	st.stepDurationsMs[bucket] += duration.Milliseconds()
+}
+
+func (st *state) StepDurations() map[string]int64 {
+	st.mtx.RLock()
+	defer st.mtx.RUnlock()
+
+	out := make(map[string]int64, len(st.stepDurationsMs))
+	for bucket, duration := range st.stepDurationsMs {
+		out[bucket] = duration
+	}
+	return out
+}
+
+func (st *state) RecordConnectorCall(method string, duration time.Duration) {
+	st.mtx.Lock()
+	defer st.mtx.Unlock()
+
+	if st.connectorCallStats == nil {
+		st.connectorCallStats = make(map[string]*ConnectorCallStat)
+	}
+	stat := st.connectorCallStats[method]
+	if stat == nil {
+		stat = &ConnectorCallStat{}
+		st.connectorCallStats[method] = stat
+	}
+	durationMs := duration.Milliseconds()
+	stat.Count++
+	stat.TotalMs += durationMs
+	if durationMs > stat.MaxMs {
+		stat.MaxMs = durationMs
+	}
+}
+
+func (st *state) ConnectorCallStats() map[string]ConnectorCallStat {
+	st.mtx.RLock()
+	defer st.mtx.RUnlock()
+
+	out := make(map[string]ConnectorCallStat, len(st.connectorCallStats))
+	for method, stat := range st.connectorCallStats {
+		if stat != nil {
+			out[method] = *stat
+		}
+	}
+	return out
+}
+
+func (st *state) RecordSessionOp(op string, duration time.Duration, opErr error, timedOut bool) {
+	st.mtx.Lock()
+	defer st.mtx.Unlock()
+
+	if st.sessionStoreStats == nil {
+		st.sessionStoreStats = make(map[string]*SessionStoreStat)
+	}
+	stat := st.sessionStoreStats[op]
+	if stat == nil {
+		stat = &SessionStoreStat{}
+		st.sessionStoreStats[op] = stat
+	}
+	durationMs := duration.Milliseconds()
+	stat.Count++
+	stat.TotalMs += durationMs
+	if durationMs > stat.MaxMs {
+		stat.MaxMs = durationMs
+	}
+	if opErr != nil {
+		stat.Errors++
+		if timedOut {
+			stat.Timeouts++
+		}
+	}
+}
+
+// MergeConnectorCallStat folds pre-aggregated connector-call stats (e.g. a
+// compacted partial's totals) into method's cumulative counters.
+func (st *state) MergeConnectorCallStat(method string, add ConnectorCallStat) {
+	st.mtx.Lock()
+	defer st.mtx.Unlock()
+
+	if st.connectorCallStats == nil {
+		st.connectorCallStats = make(map[string]*ConnectorCallStat)
+	}
+	stat := st.connectorCallStats[method]
+	if stat == nil {
+		stat = &ConnectorCallStat{}
+		st.connectorCallStats[method] = stat
+	}
+	stat.Count += add.Count
+	stat.TotalMs += add.TotalMs
+	if add.MaxMs > stat.MaxMs {
+		stat.MaxMs = add.MaxMs
+	}
+}
+
+// MergeSessionStat folds pre-aggregated session stats (e.g. a connector's
+// per-request usage report) into op's cumulative counters.
+func (st *state) MergeSessionStat(op string, add SessionStoreStat) {
+	st.mtx.Lock()
+	defer st.mtx.Unlock()
+
+	if st.sessionStoreStats == nil {
+		st.sessionStoreStats = make(map[string]*SessionStoreStat)
+	}
+	stat := st.sessionStoreStats[op]
+	if stat == nil {
+		stat = &SessionStoreStat{}
+		st.sessionStoreStats[op] = stat
+	}
+	stat.Count += add.Count
+	stat.Errors += add.Errors
+	stat.Timeouts += add.Timeouts
+	stat.TotalMs += add.TotalMs
+	if add.MaxMs > stat.MaxMs {
+		stat.MaxMs = add.MaxMs
+	}
+}
+
+func (st *state) SessionStoreStats() map[string]SessionStoreStat {
+	st.mtx.RLock()
+	defer st.mtx.RUnlock()
+
+	out := make(map[string]SessionStoreStat, len(st.sessionStoreStats))
+	for op, stat := range st.sessionStoreStats {
+		if stat != nil {
+			out[op] = *stat
+		}
+	}
+	return out
+}
+
+func (st *state) SetIngestQuality(quality *IngestQualityCheckpoint) {
+	st.mtx.Lock()
+	defer st.mtx.Unlock()
+	st.ingestQuality = cloneIngestQualityCheckpoint(quality)
+}
+
+func (st *state) IngestQuality() *IngestQualityCheckpoint {
+	st.mtx.RLock()
+	defer st.mtx.RUnlock()
+	return cloneIngestQualityCheckpoint(st.ingestQuality)
+}
+
+func cloneIngestQualityCheckpoint(in *IngestQualityCheckpoint) *IngestQualityCheckpoint {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
+}
+
 func makeActionID(id uint64) string {
 	return fmt.Sprintf("%010d", id)
 }
 
 // PushAction adds a new action to the stack.
 func (st *state) PushAction(ctx context.Context, action Action) {
+	st.pushAction(ctx, action)
+}
+
+// pushAction adds an action and returns the checkpointed copy, including its
+// assigned ID. The scheduler uses that copy to admit spawned work without
+// changing the exported State interface.
+func (st *state) pushAction(ctx context.Context, action Action) *Action {
 	st.mtx.Lock()
 	defer st.mtx.Unlock()
 
@@ -472,7 +790,108 @@ func (st *state) PushAction(ctx context.Context, action Action) {
 	}
 	st.actions[action.ID] = action
 	st.actionOrder = append(st.actionOrder, action.ID)
+	st.recordSpawnedAdmissionLocked(action)
 	ctxzap.Extract(ctx).Debug("pushed action", zap.Any("action", action))
+	return &action
+}
+
+// recordSpawnedAdmissionLocked enrolls a spawned cursor in the I10
+// drain-evidence set and the re-mention guard index. Caller holds st.mtx.
+func (st *state) recordSpawnedAdmissionLocked(action Action) {
+	if !action.Spawned {
+		return
+	}
+	if st.spawnedInFlight == nil {
+		st.spawnedInFlight = make(map[string]Action)
+	}
+	st.spawnedInFlight[action.ID] = action
+	if st.spawnedAdmitted == nil {
+		st.spawnedAdmitted = make(map[parallelActionKey]string)
+	}
+	st.spawnedAdmitted[makeParallelActionKey(&action)] = action.ID
+}
+
+func (st *state) markTypeScopedPlanned(actionID string) {
+	st.mtx.Lock()
+	defer st.mtx.Unlock()
+	action, ok := st.actions[actionID]
+	if !ok {
+		return
+	}
+	action.TypeScopedPlanned = true
+	st.actions[actionID] = action
+}
+
+func (st *state) transitionAction(
+	ctx context.Context,
+	parent *Action,
+	nextPageToken string,
+	childActions []Action,
+) ([]*Action, error) {
+	st.mtx.Lock()
+	defer st.mtx.Unlock()
+	if parent == nil {
+		return nil, errors.New("parent action cannot be nil")
+	}
+	if _, ok := st.actions[parent.ID]; !ok {
+		return nil, fmt.Errorf("action ID %s does not exist", parent.ID)
+	}
+	for _, child := range childActions {
+		if child.ID != "" {
+			return nil, errors.New("action ID must be empty for new actions")
+		}
+	}
+
+	pushed := make([]*Action, 0, len(childActions))
+	for _, child := range childActions {
+		// Re-mention guard: a spawned child whose identity was already
+		// admitted in this process is the same work, already scheduled
+		// or done. Re-admitting it duplicates work at best; at worst it
+		// never terminates (mutual mentions re-admitting each other
+		// across batch boundaries, where the queue's per-batch dedup
+		// cannot see them). Skip it, loudly.
+		if child.Spawned {
+			if priorID, dup := st.spawnedAdmitted[makeParallelActionKey(&child)]; dup {
+				ctxzap.Extract(ctx).Warn(
+					"skipping re-mentioned spawned cursor: identical work was already admitted this sync",
+					zap.String("existing_action_id", priorID),
+					zap.String("op", child.Op.String()),
+					zap.String("resource_type_id", child.ResourceTypeID),
+					zap.String("resource_id", child.ResourceID),
+				)
+				continue
+			}
+		}
+		child.ID = makeActionID(st.currentActionID)
+		st.currentActionID++
+		if _, ok := st.actions[child.ID]; ok {
+			panic(fmt.Sprintf("action ID for new action %s already exists", child.ID))
+		}
+		st.actions[child.ID] = child
+		st.actionOrder = append(st.actionOrder, child.ID)
+		st.recordSpawnedAdmissionLocked(child)
+		childCopy := child
+		pushed = append(pushed, &childCopy)
+		ctxzap.Extract(ctx).Debug("pushed action", zap.Any("action", child))
+	}
+
+	if nextPageToken != "" {
+		updated := st.actions[parent.ID]
+		updated.PageToken = nextPageToken
+		st.actions[parent.ID] = updated
+		return pushed, nil
+	}
+
+	index, ok := slices.BinarySearch(st.actionOrder, parent.ID)
+	if !ok {
+		panic(fmt.Sprintf("action ID %s does not exist in action order", parent.ID))
+	}
+	st.actionOrder = slices.Delete(st.actionOrder, index, index+1)
+	delete(st.actions, parent.ID)
+	delete(st.spawnedInFlight, parent.ID)
+	st.completedActionsCount++
+	ctxzap.Extract(ctx).Debug("finishing action", zap.Any("action", parent))
+	return pushed, nil
 }
 
 // FinishAction pops the current action from the state.
@@ -494,6 +913,7 @@ func (st *state) FinishAction(ctx context.Context, action *Action) {
 	}
 	st.actionOrder = slices.Delete(st.actionOrder, index, index+1)
 	delete(st.actions, action.ID)
+	delete(st.spawnedInFlight, action.ID)
 	st.completedActionsCount++
 	ctxzap.Extract(ctx).Debug("finishing action", zap.Any("action", action))
 }
@@ -515,43 +935,67 @@ func (st *state) NextPage(ctx context.Context, actionID string, pageToken string
 	return nil
 }
 
+// The boolean flag accessors below take st.mtx because parallel workers set
+// them concurrently mid-batch (e.g. every grant carrying an expandable
+// annotation calls SetNeedsExpansion from its worker goroutine).
+
 func (st *state) NeedsExpansion() bool {
+	st.mtx.RLock()
+	defer st.mtx.RUnlock()
 	return st.needsExpansion
 }
 
 func (st *state) SetNeedsExpansion() {
+	st.mtx.Lock()
+	defer st.mtx.Unlock()
 	st.needsExpansion = true
 }
 
 func (st *state) HasExternalResourcesGrants() bool {
+	st.mtx.RLock()
+	defer st.mtx.RUnlock()
 	return st.hasExternalResourceGrants
 }
 
 func (st *state) SetHasExternalResourcesGrants() {
+	st.mtx.Lock()
+	defer st.mtx.Unlock()
 	st.hasExternalResourceGrants = true
 }
 
 func (st *state) ShouldFetchRelatedResources() bool {
+	st.mtx.RLock()
+	defer st.mtx.RUnlock()
 	return st.shouldFetchRelatedResources
 }
 
 func (st *state) SetShouldFetchRelatedResources() {
+	st.mtx.Lock()
+	defer st.mtx.Unlock()
 	st.shouldFetchRelatedResources = true
 }
 
 func (st *state) ShouldSkipEntitlementsAndGrants() bool {
+	st.mtx.RLock()
+	defer st.mtx.RUnlock()
 	return st.shouldSkipEntitlementsAndGrants
 }
 
 func (st *state) SetShouldSkipEntitlementsAndGrants() {
+	st.mtx.Lock()
+	defer st.mtx.Unlock()
 	st.shouldSkipEntitlementsAndGrants = true
 }
 
 func (st *state) ShouldSkipGrants() bool {
+	st.mtx.RLock()
+	defer st.mtx.RUnlock()
 	return st.shouldSkipGrants
 }
 
 func (st *state) SetShouldSkipGrants() {
+	st.mtx.Lock()
+	defer st.mtx.Unlock()
 	st.shouldSkipGrants = true
 }
 
@@ -572,60 +1016,4 @@ func (st *state) GetCompletedActionsCount() uint64 {
 	st.mtx.RLock()
 	defer st.mtx.RUnlock()
 	return st.completedActionsCount
-}
-
-func (st *state) CheckAndSetExclusionGroupResourceType(exclusionGroupID, resourceTypeID string) (string, bool) {
-	st.mtx.Lock()
-	defer st.mtx.Unlock()
-
-	if st.exclusionGroupResourceTypes == nil {
-		st.exclusionGroupResourceTypes = make(map[string]string)
-	}
-	if existing, ok := st.exclusionGroupResourceTypes[exclusionGroupID]; ok {
-		if existing != resourceTypeID {
-			return existing, true
-		}
-		return "", false
-	}
-	st.exclusionGroupResourceTypes[exclusionGroupID] = resourceTypeID
-	return "", false
-}
-
-func (st *state) CheckAndSetExclusionGroupDefault(exclusionGroupID, entitlementID string) (string, bool) {
-	st.mtx.Lock()
-	defer st.mtx.Unlock()
-
-	if st.exclusionGroupDefaults == nil {
-		st.exclusionGroupDefaults = make(map[string]string)
-	}
-	if existing, ok := st.exclusionGroupDefaults[exclusionGroupID]; ok {
-		if existing != entitlementID {
-			return existing, true
-		}
-		return "", false
-	}
-	st.exclusionGroupDefaults[exclusionGroupID] = entitlementID
-	return "", false
-}
-
-func (st *state) IncrementExclusionGroupCount(exclusionGroupID string) uint32 {
-	st.mtx.Lock()
-	defer st.mtx.Unlock()
-
-	if st.exclusionGroupCounts == nil {
-		st.exclusionGroupCounts = make(map[string]uint32)
-	}
-	st.exclusionGroupCounts[exclusionGroupID]++
-	return st.exclusionGroupCounts[exclusionGroupID]
-}
-
-// ClearExclusionGroupTracking drops the exclusion group bookkeeping maps. This
-// is meant to keep the final sync token small, mirroring ClearEntitlementGraph.
-func (st *state) ClearExclusionGroupTracking(ctx context.Context) {
-	st.mtx.Lock()
-	defer st.mtx.Unlock()
-
-	st.exclusionGroupResourceTypes = nil
-	st.exclusionGroupDefaults = nil
-	st.exclusionGroupCounts = nil
 }

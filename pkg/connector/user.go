@@ -9,7 +9,6 @@ import (
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
 	"github.com/conductorone/baton-sdk/pkg/annotations"
 	"github.com/conductorone/baton-sdk/pkg/connectorbuilder"
-	"github.com/conductorone/baton-sdk/pkg/pagination"
 	"github.com/conductorone/baton-sdk/pkg/types/resource"
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
 	"go.uber.org/zap"
@@ -18,9 +17,9 @@ import (
 )
 
 var (
-	_ connectorbuilder.ResourceSyncer  = (*userResourceType)(nil)
-	_ connectorbuilder.AccountManager  = (*userResourceType)(nil)
-	_ connectorbuilder.ResourceDeleter = (*userResourceType)(nil)
+	_ connectorbuilder.ResourceSyncerV2  = (*userResourceType)(nil)
+	_ connectorbuilder.AccountManagerV2  = (*userResourceType)(nil)
+	_ connectorbuilder.ResourceDeleterV2 = (*userResourceType)(nil)
 )
 
 // defaultInviteRole is used when CreateAccount is called without an explicit
@@ -74,10 +73,10 @@ func userResource(ctx context.Context, user *cloudamqp.User) (*v2.Resource, erro
 	return ret, nil
 }
 
-func (u *userResourceType) List(ctx context.Context, parentID *v2.ResourceId, pt *pagination.Token) ([]*v2.Resource, string, annotations.Annotations, error) {
+func (u *userResourceType) List(ctx context.Context, parentID *v2.ResourceId, opts resource.SyncOpAttrs) ([]*v2.Resource, *resource.SyncOpResults, error) {
 	users, err := u.client.GetUsers(ctx)
 	if err != nil {
-		return nil, "", nil, fmt.Errorf("baton-cloudamqp: failed to list users: %w", err)
+		return nil, nil, fmt.Errorf("baton-cloudamqp: failed to list users: %w", err)
 	}
 
 	rv := make([]*v2.Resource, 0, len(users))
@@ -86,21 +85,21 @@ func (u *userResourceType) List(ctx context.Context, parentID *v2.ResourceId, pt
 
 		ur, err := userResource(ctx, &userCopy)
 		if err != nil {
-			return nil, "", nil, err
+			return nil, nil, err
 		}
 
 		rv = append(rv, ur)
 	}
 
-	return rv, "", nil, nil
+	return rv, nil, nil
 }
 
-func (u *userResourceType) Entitlements(_ context.Context, _ *v2.Resource, _ *pagination.Token) ([]*v2.Entitlement, string, annotations.Annotations, error) {
-	return nil, "", nil, nil
+func (u *userResourceType) Entitlements(_ context.Context, _ *v2.Resource, _ resource.SyncOpAttrs) ([]*v2.Entitlement, *resource.SyncOpResults, error) {
+	return nil, nil, nil
 }
 
-func (u *userResourceType) Grants(_ context.Context, _ *v2.Resource, _ *pagination.Token) ([]*v2.Grant, string, annotations.Annotations, error) {
-	return nil, "", nil, nil
+func (u *userResourceType) Grants(_ context.Context, _ *v2.Resource, _ resource.SyncOpAttrs) ([]*v2.Grant, *resource.SyncOpResults, error) {
+	return nil, nil, nil
 }
 
 // CreateAccountCapabilityDetails declares the credential options for account
@@ -209,7 +208,7 @@ func (u *userResourceType) CreateAccount(
 // from the team list first. CloudAMQP has no soft-disable, so this is a hard
 // removal. A not-found result at either step is treated as success because the
 // platform retries deletes and the member may already be gone.
-func (u *userResourceType) Delete(ctx context.Context, resourceID *v2.ResourceId) (annotations.Annotations, error) {
+func (u *userResourceType) Delete(ctx context.Context, resourceID *v2.ResourceId, _ *v2.ResourceId) (annotations.Annotations, error) {
 	user, err := u.client.GetUserByID(ctx, resourceID.Resource)
 	if err != nil {
 		if cloudamqp.IsNotFoundError(err) {

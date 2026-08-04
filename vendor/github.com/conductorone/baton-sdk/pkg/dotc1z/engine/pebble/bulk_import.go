@@ -27,6 +27,7 @@ import (
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
 	v3 "github.com/conductorone/baton-sdk/pb/c1/storage/v3"
 	"github.com/conductorone/baton-sdk/pkg/dotc1z/engine/pebble/codec"
+	"github.com/conductorone/baton-sdk/pkg/dotc1z/engine/pebble/internal/rawdb"
 )
 
 // ErrBulkImportOutOfOrder is returned by BulkSyncImport's ordered add
@@ -50,7 +51,10 @@ const bulkSpillKeyChunkBytes = 8 << 20
 const bulkSpillBufferSize = 1 << 20
 
 // grantIndexFamilies are the index-discriminator bytes AddGrants can
-// emit (see grantIndexKeys).
+// emit (see grantIndexKeys). The by_entitlement_principal_hash index
+// is deliberately absent: it and the grant digests are derived from
+// the primaries by the fused deferred pass at seal time
+// (BuildDeferredGrantIndexes), never written inline.
 var grantIndexFamilies = []byte{
 	idxGrantByPrincipal,
 	idxGrantByNeedsExpansion,
@@ -70,9 +74,13 @@ type bulkSSTWriter struct {
 	count int
 }
 
-func newBulkSSTWriter(dir, name string) (*bulkSSTWriter, error) {
+// newBulkSSTWriter creates an SST staging file on fs. fs must be the
+// engine FS (Engine.fs()): the finished SST is handed to the pebble.DB's
+// Ingest/IngestAndExcise, which resolves the path through the DB's own
+// filesystem — creating it anywhere else breaks WithVFS engines.
+func newBulkSSTWriter(fs vfs.FS, dir, name string) (*bulkSSTWriter, error) {
 	path := filepath.Join(dir, name+".sst")
-	file, err := vfs.Default.Create(path, vfs.WriteCategoryUnspecified)
+	file, err := fs.Create(path, vfs.WriteCategoryUnspecified)
 	if err != nil {
 		return nil, fmt.Errorf("bulk sync import: create %q: %w", path, err)
 	}
@@ -208,7 +216,7 @@ func (e *Engine) StartBulkSyncImport(ctx context.Context, syncID string, tmpDir 
 	if cur := e.currentSyncBytes(); !bytes.Equal(cur, idBytes) {
 		return nil, fmt.Errorf("StartBulkSyncImport: sync %s is not the engine's current sync", syncID)
 	}
-	dir, err := os.MkdirTemp(tmpDir, "pebble-bulk-import-")
+	dir, err := e.prepareStagingDir(tmpDir, "pebble-bulk-import-")
 	if err != nil {
 		return nil, fmt.Errorf("StartBulkSyncImport: mkdir temp: %w", err)
 	}
@@ -233,7 +241,7 @@ func (e *Engine) StartBulkSyncImport(ctx context.Context, syncID string, tmpDir 
 		{&b.resourceTypes, "resource-types"},
 		{&b.resources, "resources"},
 	} {
-		sw, err := newBulkSSTWriter(dir, w.name)
+		sw, err := newBulkSSTWriter(e.fs(), dir, w.name)
 		if err != nil {
 			b.Abort()
 			return nil, err
@@ -447,7 +455,7 @@ func (b *BulkSyncImport) AddResourcesWithDiscoveredAt(ctx context.Context, resou
 		}
 		b.resourcesByRT[rec.GetResourceTypeId()]++
 		if parent := rec.GetParent(); parent != nil && parent.GetResourceId() != "" {
-			k := encodeResourceByParentIndexKey(
+			k := rawdb.EncodeResourceByParentIndexKey(
 				parent.GetResourceTypeId(), parent.GetResourceId(),
 				rec.GetResourceTypeId(), rec.GetResourceId(),
 			)
@@ -642,9 +650,9 @@ func (b *BulkSyncImport) Finish(ctx context.Context) error {
 			sstPath := filepath.Join(b.dir, u.name+".sst")
 			var err error
 			if u.resolve != nil {
-				_, err = mergeSpillChunksToSSTResolvingDuplicates(ctx, sstPath, u.name, chunks, u.resolve)
+				_, err = mergeSpillChunksToSSTResolvingDuplicates(ctx, b.e.fs(), sstPath, u.name, chunks, u.resolve)
 			} else {
-				err = mergeSortedSpillChunksToSST(ctx, sstPath, u.name, chunks)
+				err = mergeSortedSpillChunksToSST(ctx, b.e.fs(), sstPath, u.name, chunks)
 			}
 			if err != nil {
 				results[slot].err = err
@@ -683,7 +691,7 @@ func (b *BulkSyncImport) Finish(ctx context.Context) error {
 		return nil
 	}
 	err := b.e.withWrite(func() error {
-		if err := b.e.db.Ingest(ctx, paths); err != nil {
+		if err := b.e.db.IngestSSTs(ctx, paths); err != nil {
 			return fmt.Errorf("bulk sync import: ingest: %w", err)
 		}
 		b.e.noteEntitlementKeyspaceWrite()
@@ -760,7 +768,7 @@ func (b *BulkSyncImport) teardown() {
 			w.abort()
 		}
 	}
-	_ = os.RemoveAll(b.dir)
+	b.e.removeStagingDir(b.dir)
 }
 
 // --- spill sorter: unordered (key[,value]) → background chunk sort →
@@ -1108,8 +1116,9 @@ func readSpillEntry(r io.Reader, key, val *[]byte, lenBuf *[4]byte) (bool, error
 
 // mergeSortedSpillChunksToSST heap-merges the sorted chunk files into a
 // single SST. Duplicate keys are corruption (the importer requires
-// globally unique tuples) and fail the merge.
-func mergeSortedSpillChunksToSST(ctx context.Context, sstPath, name string, chunks []string) error {
+// globally unique tuples) and fail the merge. fs is the engine FS the
+// SST is created on (chunk files are plain OS scratch — see spillSorter).
+func mergeSortedSpillChunksToSST(ctx context.Context, fs vfs.FS, sstPath, name string, chunks []string) error {
 	start := time.Now()
 	l := ctxzap.Extract(ctx)
 	readers := make([]*os.File, 0, len(chunks))
@@ -1139,7 +1148,7 @@ func mergeSortedSpillChunksToSST(ctx context.Context, sstPath, name string, chun
 		}
 	}
 
-	writer, err := newBulkSSTWriter(filepath.Dir(sstPath), name)
+	writer, err := newBulkSSTWriter(fs, filepath.Dir(sstPath), name)
 	if err != nil {
 		return err
 	}
@@ -1147,7 +1156,7 @@ func mergeSortedSpillChunksToSST(ctx context.Context, sstPath, name string, chun
 	defer func() {
 		_ = writer.finish()
 		if !success {
-			_ = os.Remove(sstPath)
+			_ = fs.Remove(sstPath)
 		}
 	}()
 	var last []byte
@@ -1219,6 +1228,7 @@ func mergeSortedSpillChunksToSST(ctx context.Context, sstPath, name string, chun
 // resolved.
 func mergeSpillChunksToSSTResolvingDuplicates(
 	ctx context.Context,
+	fs vfs.FS,
 	sstPath, name string,
 	chunks []string,
 	resolve func(key []byte, values [][]byte) ([]byte, error),
@@ -1252,7 +1262,7 @@ func mergeSpillChunksToSSTResolvingDuplicates(
 		}
 	}
 
-	writer, err := newBulkSSTWriter(filepath.Dir(sstPath), name)
+	writer, err := newBulkSSTWriter(fs, filepath.Dir(sstPath), name)
 	if err != nil {
 		return 0, err
 	}
@@ -1260,7 +1270,7 @@ func mergeSpillChunksToSSTResolvingDuplicates(
 	defer func() {
 		_ = writer.finish()
 		if !success {
-			_ = os.Remove(sstPath)
+			_ = fs.Remove(sstPath)
 		}
 	}()
 
