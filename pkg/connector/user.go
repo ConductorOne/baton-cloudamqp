@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"fmt"
+	"net/mail"
 	"strings"
 
 	"github.com/conductorone/baton-cloudamqp/pkg/cloudamqp"
@@ -115,6 +116,63 @@ func (u *userResourceType) CreateAccountCapabilityDetails(_ context.Context) (*v
 	}, nil, nil
 }
 
+// isEmailAddress reports whether s is a bare email address. CloudAMQP keys
+// invitations on the email, so a value that is not one (a username, say) is
+// rejected downstream with an opaque 400.
+func isEmailAddress(s string) bool {
+	addr, err := mail.ParseAddress(s)
+	if err != nil {
+		return false
+	}
+	// Reject display-name forms ("Caro R <caro@example.com>"): CloudAMQP wants
+	// the bare address.
+	return addr.Address == s
+}
+
+// resolveInviteEmail picks the email address to invite from the account info C1
+// supplies.
+//
+// AccountInfo.Login is "the user's login", which for many C1 directories is a
+// username rather than an email address, so it must not be preferred blindly:
+// doing so sent usernames to POST /team/invite and CloudAMQP rejected them with
+// a 400 (CXH-2185). Resolution order:
+//
+//  1. AccountInfo.Emails — primary entry first, then any other valid address.
+//  2. The mapped profile's "email" field.
+//  3. Login, but only when it is itself an email address.
+func resolveInviteEmail(accountInfo *v2.AccountInfo, profileMap map[string]interface{}) (string, error) {
+	var fallback string
+	for _, e := range accountInfo.GetEmails() {
+		addr := strings.TrimSpace(e.GetAddress())
+		if !isEmailAddress(addr) {
+			continue
+		}
+		if e.GetIsPrimary() {
+			return addr, nil
+		}
+		if fallback == "" {
+			fallback = addr
+		}
+	}
+	if fallback != "" {
+		return fallback, nil
+	}
+
+	profileEmail, _ := profileMap["email"].(string)
+	if profileEmail = strings.TrimSpace(profileEmail); isEmailAddress(profileEmail) {
+		return profileEmail, nil
+	}
+
+	if login := strings.TrimSpace(accountInfo.GetLogin()); isEmailAddress(login) {
+		return login, nil
+	}
+
+	return "", status.Errorf(codes.InvalidArgument,
+		"baton-cloudamqp: create account: a valid email address is required; CloudAMQP invitations are keyed on email, "+
+			"and none of the account's emails, the mapped profile \"email\" field, or the login (%q) is one",
+		accountInfo.GetLogin())
+}
+
 // CreateAccount invites a new team member to CloudAMQP via POST /team/invite.
 //
 // Flow:
@@ -134,13 +192,9 @@ func (u *userResourceType) CreateAccount(
 	l := ctxzap.Extract(ctx)
 	profileMap := accountInfo.GetProfile().AsMap()
 
-	email := accountInfo.GetLogin()
-	if email == "" {
-		email, _ = profileMap["email"].(string)
-	}
-	email = strings.TrimSpace(email)
-	if email == "" {
-		return nil, nil, nil, status.Errorf(codes.InvalidArgument, "baton-cloudamqp: create account: email is required")
+	email, err := resolveInviteEmail(accountInfo, profileMap)
+	if err != nil {
+		return nil, nil, nil, err
 	}
 
 	role, _ := profileMap["role"].(string)
