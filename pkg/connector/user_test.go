@@ -1,12 +1,46 @@
 package connector
 
 import (
+	"context"
 	"testing"
 
+	"github.com/conductorone/baton-cloudamqp/pkg/cloudamqp"
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
+	"github.com/conductorone/baton-sdk/pkg/types/resource"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+// TestUserResourceTraitAndAttributes pins what a synced user carries after
+// profile and status moved off UserTrait onto the resource itself: the user
+// trait must still be present with the email, and the profile and status must
+// now be resource-level attributes.
+func TestUserResourceTraitAndAttributes(t *testing.T) {
+	res, err := userResource(context.Background(), &cloudamqp.User{
+		BaseResource: cloudamqp.BaseResource{Id: "42"},
+		Email:        "user@example.com",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	trait, err := resource.GetUserTrait(res)
+	if err != nil {
+		t.Fatalf("user trait missing: %v", err)
+	}
+	if got := trait.GetEmails(); len(got) != 1 || got[0].GetAddress() != "user@example.com" || !got[0].GetIsPrimary() {
+		t.Fatalf("expected one primary email user@example.com, got %v", got)
+	}
+
+	if got := res.GetStatus().GetStatus(); got != v2.Status_RESOURCE_STATUS_ENABLED {
+		t.Fatalf("resource status = %v, want RESOURCE_STATUS_ENABLED", got)
+	}
+
+	profile := res.GetProfile().AsMap()
+	if profile["login"] != "user@example.com" || profile["user_id"] != "42" {
+		t.Fatalf("resource profile = %v, want login and user_id set", profile)
+	}
+}
 
 func TestResolveInviteEmail(t *testing.T) {
 	email := func(addr string, primary bool) *v2.AccountInfo_Email {

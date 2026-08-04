@@ -63,9 +63,9 @@ func userResource(ctx context.Context, user *cloudamqp.User) (*v2.Resource, erro
 		user.Id,
 		[]resource.UserTraitOption{
 			resource.WithEmail(user.Email, true),
-			resource.WithUserProfile(profile),
-			resource.WithStatus(v2.UserTrait_Status_STATUS_ENABLED),
 		},
+		resource.WithResourceProfile(profile),
+		resource.WithResourceStatus(v2.Status_RESOURCE_STATUS_ENABLED, ""),
 	)
 	if err != nil {
 		return nil, err
