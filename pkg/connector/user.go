@@ -130,18 +130,25 @@ func isEmailAddress(s string) bool {
 }
 
 // resolveInviteEmail picks the email address to invite from the account info C1
-// supplies.
+// supplies. Resolution order:
 //
-// AccountInfo.Login is "the user's login", which for many C1 directories is a
-// username rather than an email address, so it must not be preferred blindly:
-// doing so sends usernames to POST /team/invite, which CloudAMQP rejects with a
-// 400. Resolution order:
-//
-//  1. AccountInfo.Emails — primary entry first, then any other valid address.
-//  2. The mapped profile's "email" field.
+//  1. The schema-declared profile "email" field — the value the admin mapped or
+//     typed. It WINS: resolving anything ahead of it would silently override an
+//     explicit choice.
+//  2. AccountInfo.Emails — the primary entry, else any other valid address.
 //  3. Login, but only when it is itself an email address.
+//
+// Login must never be preferred blindly. It is documented as "the user's login",
+// which for many C1 directories is a username, and sending a username to
+// POST /team/invite makes CloudAMQP reject the request with an opaque 400.
 func resolveInviteEmail(accountInfo *v2.AccountInfo, profileMap map[string]interface{}) (string, error) {
-	var fallback string
+	// Key must match the "email" field of the account-creation schema.
+	profileEmail, _ := profileMap["email"].(string)
+	if profileEmail = strings.TrimSpace(profileEmail); isEmailAddress(profileEmail) {
+		return profileEmail, nil
+	}
+
+	var secondary string
 	for _, e := range accountInfo.GetEmails() {
 		addr := strings.TrimSpace(e.GetAddress())
 		if !isEmailAddress(addr) {
@@ -150,17 +157,12 @@ func resolveInviteEmail(accountInfo *v2.AccountInfo, profileMap map[string]inter
 		if e.GetIsPrimary() {
 			return addr, nil
 		}
-		if fallback == "" {
-			fallback = addr
+		if secondary == "" {
+			secondary = addr
 		}
 	}
-	if fallback != "" {
-		return fallback, nil
-	}
-
-	profileEmail, _ := profileMap["email"].(string)
-	if profileEmail = strings.TrimSpace(profileEmail); isEmailAddress(profileEmail) {
-		return profileEmail, nil
+	if secondary != "" {
+		return secondary, nil
 	}
 
 	if login := strings.TrimSpace(accountInfo.GetLogin()); isEmailAddress(login) {
@@ -169,7 +171,7 @@ func resolveInviteEmail(accountInfo *v2.AccountInfo, profileMap map[string]inter
 
 	return "", status.Errorf(codes.InvalidArgument,
 		"baton-cloudamqp: create account: a valid email address is required; CloudAMQP invitations are keyed on email, "+
-			"and none of the account's emails, the mapped profile \"email\" field, or the login (%q) is one",
+			"and none of the mapped profile \"email\" field, the account's emails, or the login (%q) is one",
 		accountInfo.GetLogin())
 }
 

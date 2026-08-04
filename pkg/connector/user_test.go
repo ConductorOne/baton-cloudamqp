@@ -27,18 +27,27 @@ func TestResolveInviteEmail(t *testing.T) {
 			want:    "user@example.com",
 		},
 		{
-			name: "primary email wins over login and profile",
+			name: "profile email wins over emails and login",
 			info: &v2.AccountInfo{
 				Login:  "someone@else.com",
-				Emails: []*v2.AccountInfo_Email{email("alt@example.com", false), email("primary@example.com", true)},
+				Emails: []*v2.AccountInfo_Email{email("primary@example.com", true)},
 			},
 			profile: map[string]interface{}{"email": "profile@example.com"},
+			want:    "profile@example.com",
+		},
+		{
+			name: "primary email used when profile has none",
+			info: &v2.AccountInfo{
+				Login:  "test",
+				Emails: []*v2.AccountInfo_Email{email("alt@example.com", false), email("primary@example.com", true)},
+			},
+			profile: map[string]interface{}{},
 			want:    "primary@example.com",
 		},
 		{
 			name:    "non-primary email used when no primary is marked",
 			info:    &v2.AccountInfo{Emails: []*v2.AccountInfo_Email{email("alt@example.com", false)}},
-			profile: map[string]interface{}{"email": "profile@example.com"},
+			profile: map[string]interface{}{},
 			want:    "alt@example.com",
 		},
 		{
@@ -60,10 +69,16 @@ func TestResolveInviteEmail(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "invalid emails are skipped in favour of profile",
-			info:    &v2.AccountInfo{Emails: []*v2.AccountInfo_Email{email("not-an-email", true)}},
-			profile: map[string]interface{}{"email": "profile@example.com"},
-			want:    "profile@example.com",
+			name:    "invalid primary email falls through to a valid secondary",
+			info:    &v2.AccountInfo{Emails: []*v2.AccountInfo_Email{email("not-an-email", true), email("alt@example.com", false)}},
+			profile: map[string]interface{}{},
+			want:    "alt@example.com",
+		},
+		{
+			name:    "non-email profile value falls through to emails",
+			info:    &v2.AccountInfo{Emails: []*v2.AccountInfo_Email{email("primary@example.com", true)}},
+			profile: map[string]interface{}{"email": "not-an-email"},
+			want:    "primary@example.com",
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
