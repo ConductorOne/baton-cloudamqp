@@ -23,8 +23,8 @@ func TestResolveInviteEmail(t *testing.T) {
 		{
 			name:    "username login falls back to profile email",
 			info:    &v2.AccountInfo{Login: "test"},
-			profile: map[string]interface{}{"email": "caro@example.com"},
-			want:    "caro@example.com",
+			profile: map[string]interface{}{"email": "user@example.com"},
+			want:    "user@example.com",
 		},
 		{
 			name: "primary email wins over login and profile",
@@ -43,13 +43,13 @@ func TestResolveInviteEmail(t *testing.T) {
 		},
 		{
 			name:    "email-shaped login is accepted",
-			info:    &v2.AccountInfo{Login: " caro@example.com "},
+			info:    &v2.AccountInfo{Login: " user@example.com "},
 			profile: map[string]interface{}{},
-			want:    "caro@example.com",
+			want:    "user@example.com",
 		},
 		{
 			name:    "display-name form is rejected",
-			info:    &v2.AccountInfo{Login: "Caro R <caro@example.com>"},
+			info:    &v2.AccountInfo{Login: "Example User <user@example.com>"},
 			profile: map[string]interface{}{},
 			wantErr: true,
 		},

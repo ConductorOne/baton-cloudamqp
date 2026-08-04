@@ -124,8 +124,8 @@ func isEmailAddress(s string) bool {
 	if err != nil {
 		return false
 	}
-	// Reject display-name forms ("Caro R <caro@example.com>"): CloudAMQP wants
-	// the bare address.
+	// Reject display-name forms ("Example User <user@example.com>"): CloudAMQP
+	// wants the bare address.
 	return addr.Address == s
 }
 
@@ -134,8 +134,8 @@ func isEmailAddress(s string) bool {
 //
 // AccountInfo.Login is "the user's login", which for many C1 directories is a
 // username rather than an email address, so it must not be preferred blindly:
-// doing so sent usernames to POST /team/invite and CloudAMQP rejected them with
-// a 400 (CXH-2185). Resolution order:
+// doing so sends usernames to POST /team/invite, which CloudAMQP rejects with a
+// 400. Resolution order:
 //
 //  1. AccountInfo.Emails — primary entry first, then any other valid address.
 //  2. The mapped profile's "email" field.
