@@ -141,9 +141,9 @@ func isEmailAddress(s string) bool {
 // Login must never be preferred blindly. It is documented as "the user's login",
 // which for many C1 directories is a username, and sending a username to
 // POST /team/invite makes CloudAMQP reject the request with an opaque 400.
-func resolveInviteEmail(accountInfo *v2.AccountInfo, profileMap map[string]interface{}) (string, error) {
+func resolveInviteEmail(accountInfo *v2.AccountInfo) (string, error) {
 	// Key must match the "email" field of the account-creation schema.
-	profileEmail, _ := profileMap["email"].(string)
+	profileEmail, _ := resource.GetProfileStringValue(accountInfo.GetProfile(), "email")
 	if profileEmail = strings.TrimSpace(profileEmail); isEmailAddress(profileEmail) {
 		return profileEmail, nil
 	}
@@ -192,14 +192,12 @@ func (u *userResourceType) CreateAccount(
 	ctx context.Context, accountInfo *v2.AccountInfo, _ *v2.LocalCredentialOptions,
 ) (connectorbuilder.CreateAccountResponse, []*v2.PlaintextData, annotations.Annotations, error) {
 	l := ctxzap.Extract(ctx)
-	profileMap := accountInfo.GetProfile().AsMap()
-
-	email, err := resolveInviteEmail(accountInfo, profileMap)
+	email, err := resolveInviteEmail(accountInfo)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
-	role, _ := profileMap["role"].(string)
+	role, _ := resource.GetProfileStringValue(accountInfo.GetProfile(), "role")
 	role = strings.ToLower(strings.TrimSpace(role))
 	if role == "" {
 		role = defaultInviteRole
@@ -208,7 +206,7 @@ func (u *userResourceType) CreateAccount(
 		return nil, nil, nil, status.Errorf(codes.InvalidArgument, "baton-cloudamqp: create account: unknown role %q (valid: %v)", role, knownInviteRoles)
 	}
 
-	tagsRaw, _ := profileMap["tags"].([]interface{})
+	tagsRaw, _ := accountInfo.GetProfile().AsMap()["tags"].([]interface{})
 	var tags []string
 	for _, t := range tagsRaw {
 		if s, ok := t.(string); ok {
