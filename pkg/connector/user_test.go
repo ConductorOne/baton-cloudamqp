@@ -109,11 +109,11 @@ func TestResolveInviteEmail(t *testing.T) {
 			want: "alt@example.com",
 		},
 		{
-			name: "non-email profile value falls through to emails",
+			name: "non-email profile value is a mapping error, not a fallthrough",
 			info: withProfileEmail(&v2.AccountInfo{
 				Emails: []*v2.AccountInfo_Email{email("primary@example.com", true)},
 			}, "not-an-email"),
-			want: "primary@example.com",
+			wantErr: true,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

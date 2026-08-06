@@ -134,7 +134,9 @@ func isEmailAddress(s string) bool {
 //
 //  1. The schema-declared profile "email" field — the value the admin mapped or
 //     typed. It WINS: resolving anything ahead of it would silently override an
-//     explicit choice.
+//     explicit choice. If it's present but not email-shaped, that's a mapping
+//     mistake, and we fail loud rather than silently inviting a different
+//     address than the one the admin mapped.
 //  2. AccountInfo.Emails — the primary entry, else any other valid address.
 //  3. Login, but only when it is itself an email address.
 //
@@ -144,7 +146,13 @@ func isEmailAddress(s string) bool {
 func resolveInviteEmail(accountInfo *v2.AccountInfo) (string, error) {
 	// Key must match the "email" field of the account-creation schema.
 	profileEmail, _ := resource.GetProfileStringValue(accountInfo.GetProfile(), "email")
-	if profileEmail = strings.TrimSpace(profileEmail); isEmailAddress(profileEmail) {
+	profileEmail = strings.TrimSpace(profileEmail)
+	if profileEmail != "" {
+		if !isEmailAddress(profileEmail) {
+			return "", status.Errorf(codes.InvalidArgument,
+				"baton-cloudamqp: create account: mapped profile \"email\" field (%q) is not a valid email address",
+				profileEmail)
+		}
 		return profileEmail, nil
 	}
 
