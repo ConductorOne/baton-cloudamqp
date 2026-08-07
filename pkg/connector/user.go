@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"fmt"
+	"net/mail"
 	"strings"
 
 	"github.com/conductorone/baton-cloudamqp/pkg/cloudamqp"
@@ -62,9 +63,9 @@ func userResource(ctx context.Context, user *cloudamqp.User) (*v2.Resource, erro
 		user.Id,
 		[]resource.UserTraitOption{
 			resource.WithEmail(user.Email, true),
-			resource.WithUserProfile(profile),
-			resource.WithStatus(v2.UserTrait_Status_STATUS_ENABLED),
 		},
+		resource.WithResourceProfile(profile),
+		resource.WithResourceStatus(v2.Status_RESOURCE_STATUS_ENABLED, ""),
 	)
 	if err != nil {
 		return nil, err
@@ -115,6 +116,73 @@ func (u *userResourceType) CreateAccountCapabilityDetails(_ context.Context) (*v
 	}, nil, nil
 }
 
+// isEmailAddress reports whether s is a bare email address. CloudAMQP keys
+// invitations on the email, so a value that is not one (a username, say) is
+// rejected downstream with an opaque 400.
+func isEmailAddress(s string) bool {
+	addr, err := mail.ParseAddress(s)
+	if err != nil {
+		return false
+	}
+	// Reject display-name forms ("Example User <user@example.com>"): CloudAMQP
+	// wants the bare address.
+	return addr.Address == s
+}
+
+// resolveInviteEmail picks the email address to invite from the account info C1
+// supplies. Resolution order:
+//
+//  1. The schema-declared profile "email" field — the value the admin mapped or
+//     typed. It WINS: resolving anything ahead of it would silently override an
+//     explicit choice. If it's present but not email-shaped, that's a mapping
+//     mistake, and we fail loud rather than silently inviting a different
+//     address than the one the admin mapped.
+//  2. AccountInfo.Emails — the primary entry, else any other valid address.
+//  3. Login, but only when it is itself an email address.
+//
+// Login must never be preferred blindly. It is documented as "the user's login",
+// which for many C1 directories is a username, and sending a username to
+// POST /team/invite makes CloudAMQP reject the request with an opaque 400.
+func resolveInviteEmail(accountInfo *v2.AccountInfo) (string, error) {
+	// Key must match the "email" field of the account-creation schema.
+	profileEmail, _ := resource.GetProfileStringValue(accountInfo.GetProfile(), "email")
+	profileEmail = strings.TrimSpace(profileEmail)
+	if profileEmail != "" {
+		if !isEmailAddress(profileEmail) {
+			return "", status.Errorf(codes.InvalidArgument,
+				"baton-cloudamqp: create account: mapped profile \"email\" field (%q) is not a valid email address",
+				profileEmail)
+		}
+		return profileEmail, nil
+	}
+
+	var secondary string
+	for _, e := range accountInfo.GetEmails() {
+		addr := strings.TrimSpace(e.GetAddress())
+		if !isEmailAddress(addr) {
+			continue
+		}
+		if e.GetIsPrimary() {
+			return addr, nil
+		}
+		if secondary == "" {
+			secondary = addr
+		}
+	}
+	if secondary != "" {
+		return secondary, nil
+	}
+
+	if login := strings.TrimSpace(accountInfo.GetLogin()); isEmailAddress(login) {
+		return login, nil
+	}
+
+	return "", status.Errorf(codes.InvalidArgument,
+		"baton-cloudamqp: create account: a valid email address is required; CloudAMQP invitations are keyed on email, "+
+			"and none of the mapped profile \"email\" field, the account's emails, or the login (%q) is one",
+		accountInfo.GetLogin())
+}
+
 // CreateAccount invites a new team member to CloudAMQP via POST /team/invite.
 //
 // Flow:
@@ -132,18 +200,12 @@ func (u *userResourceType) CreateAccount(
 	ctx context.Context, accountInfo *v2.AccountInfo, _ *v2.LocalCredentialOptions,
 ) (connectorbuilder.CreateAccountResponse, []*v2.PlaintextData, annotations.Annotations, error) {
 	l := ctxzap.Extract(ctx)
-	profileMap := accountInfo.GetProfile().AsMap()
-
-	email := accountInfo.GetLogin()
-	if email == "" {
-		email, _ = profileMap["email"].(string)
-	}
-	email = strings.TrimSpace(email)
-	if email == "" {
-		return nil, nil, nil, status.Errorf(codes.InvalidArgument, "baton-cloudamqp: create account: email is required")
+	email, err := resolveInviteEmail(accountInfo)
+	if err != nil {
+		return nil, nil, nil, err
 	}
 
-	role, _ := profileMap["role"].(string)
+	role, _ := resource.GetProfileStringValue(accountInfo.GetProfile(), "role")
 	role = strings.ToLower(strings.TrimSpace(role))
 	if role == "" {
 		role = defaultInviteRole
@@ -152,7 +214,7 @@ func (u *userResourceType) CreateAccount(
 		return nil, nil, nil, status.Errorf(codes.InvalidArgument, "baton-cloudamqp: create account: unknown role %q (valid: %v)", role, knownInviteRoles)
 	}
 
-	tagsRaw, _ := profileMap["tags"].([]interface{})
+	tagsRaw, _ := accountInfo.GetProfile().AsMap()["tags"].([]interface{})
 	var tags []string
 	for _, t := range tagsRaw {
 		if s, ok := t.(string); ok {
