@@ -15,6 +15,15 @@ import (
 // place that classification of those errors lives, used by the connector layer
 // for idempotency decisions (already-exists on create, not-found on delete).
 
+// maxAPIErrorBodyBytes bounds how much of a failed response body newAPIError
+// reads. CloudAMQP's error bodies are a short {"error":"..."} object; this
+// just keeps a misbehaving upstream from forcing an unbounded read.
+const maxAPIErrorBodyBytes = 1 << 16
+
+// alreadyInvitedMsgFragment is the substring CloudAMQP's error message carries
+// for a duplicate POST /team/invite (see IsAlreadyInvitedError).
+const alreadyInvitedMsgFragment = "already invited"
+
 // apiErrorBody is the shape CloudAMQP uses for error responses, e.g.
 // {"error":"User is already invited"}.
 type apiErrorBody struct {
@@ -29,13 +38,13 @@ type apiErrorBody struct {
 // to a generic message rather than fail the request over it.
 func newAPIError(statusCode int, body io.Reader) error {
 	msg := "Request failed"
-	if raw, err := io.ReadAll(body); err == nil && len(raw) > 0 {
+	if raw, err := io.ReadAll(io.LimitReader(body, maxAPIErrorBodyBytes)); err == nil && len(raw) > 0 {
 		var parsed apiErrorBody
 		if json.Unmarshal(raw, &parsed) == nil && parsed.Error != "" {
 			msg = parsed.Error
 		}
 	}
-	//nolint:gosec // statusCode is always a valid HTTP code
+	//nolint:gosec // statusCode is always a valid HTTP code, so the int-to-uint32 conversion cannot overflow or wrap
 	return status.Error(codes.Code(uint32(statusCode)), msg)
 }
 
@@ -70,5 +79,5 @@ func IsAlreadyInvitedError(err error) bool {
 	if status.Code(err) != codes.Code(http.StatusBadRequest) {
 		return false
 	}
-	return strings.Contains(strings.ToLower(status.Convert(err).Message()), "already invited")
+	return strings.Contains(strings.ToLower(status.Convert(err).Message()), alreadyInvitedMsgFragment)
 }

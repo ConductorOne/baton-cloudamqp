@@ -252,7 +252,7 @@ func (u *userResourceType) CreateAccount(
 			}
 			return &v2.CreateAccountResponse_AlreadyExistsResult{Resource: res}, nil, nil, nil
 		} else if !cloudamqp.IsNotFoundError(ferr) {
-			return nil, nil, nil, fmt.Errorf("baton-cloudamqp: create account: failed to re-resolve member %s after 409: %w", email, ferr)
+			return nil, nil, nil, fmt.Errorf("baton-cloudamqp: create account: failed to re-resolve member %s after already-exists invite response: %w", email, ferr)
 		}
 		return &v2.CreateAccountResponse_ActionRequiredResult{
 			Message:               fmt.Sprintf("Invitation already pending for %s. The user must accept the email invitation to complete account creation.", email),

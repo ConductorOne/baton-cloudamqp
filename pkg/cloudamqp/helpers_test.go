@@ -25,7 +25,7 @@ func TestNewAPIError(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			err := newAPIError(tt.code, strings.NewReader(tt.body))
-			if status.Code(err) != codes.Code(uint32(tt.code)) { //nolint:gosec
+			if status.Code(err) != codes.Code(uint32(tt.code)) { //nolint:gosec // tt.code is always a small literal HTTP status in this test table
 				t.Fatalf("code = %v, want %d", status.Code(err), tt.code)
 			}
 			if status.Convert(err).Message() != tt.wantMsg {
