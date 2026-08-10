@@ -239,10 +239,12 @@ func (u *userResourceType) CreateAccount(
 
 	// Step 2: send the invitation.
 	if err := u.client.InviteUser(ctx, email, role, tags); err != nil {
-		if !cloudamqp.IsAlreadyExistsError(err) {
+		// CloudAMQP answers a duplicate invite with HTTP 400, not 409 (see
+		// IsAlreadyInvitedError), so both must be checked here.
+		if !cloudamqp.IsAlreadyExistsError(err) && !cloudamqp.IsAlreadyInvitedError(err) {
 			return nil, nil, nil, fmt.Errorf("baton-cloudamqp: create account: failed to invite %s: %w", email, err)
 		}
-		// Invite reported already-exists: re-resolve to decide member vs pending.
+		// Invite reported already-exists/already-invited: re-resolve to decide member vs pending.
 		if existing, ferr := u.client.GetUserByEmail(ctx, email); ferr == nil {
 			res, resErr := userResource(ctx, existing)
 			if resErr != nil {
@@ -250,7 +252,7 @@ func (u *userResourceType) CreateAccount(
 			}
 			return &v2.CreateAccountResponse_AlreadyExistsResult{Resource: res}, nil, nil, nil
 		} else if !cloudamqp.IsNotFoundError(ferr) {
-			return nil, nil, nil, fmt.Errorf("baton-cloudamqp: create account: failed to re-resolve member %s after 409: %w", email, ferr)
+			return nil, nil, nil, fmt.Errorf("baton-cloudamqp: create account: failed to re-resolve member %s after already-exists invite response: %w", email, ferr)
 		}
 		return &v2.CreateAccountResponse_ActionRequiredResult{
 			Message:               fmt.Sprintf("Invitation already pending for %s. The user must accept the email invitation to complete account creation.", email),
