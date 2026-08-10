@@ -192,7 +192,7 @@ func (c *Client) doRequest(
 	defer rawResponse.Body.Close()
 
 	if rawResponse.StatusCode >= 300 {
-		return status.Error(codes.Code(uint32(rawResponse.StatusCode)), "Request failed") //nolint:gosec // StatusCode is always valid HTTP code
+		return newAPIError(rawResponse.StatusCode, rawResponse.Body)
 	}
 
 	// Provisioning calls (invite/remove/update-role) pass a nil response target
