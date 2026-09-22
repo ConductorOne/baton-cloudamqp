@@ -1,0 +1,185 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "CloudAMQP Customer API (baton-cloudamqp surface)",
+    "version": "2026-09-22",
+    "description": "The subset of the CloudAMQP Customer API that baton-cloudamqp calls. Scope is connector scope: four operations, and only the response fields the connector's structs declare. Role values are taken from https://www.cloudamqp.com/docs/cloudamqp-user-access-control.html (accessed 2026-09-22), which documents the same six roles the connector enumerates in pkg/connector/role.go.",
+    "contact": {
+      "name": "CloudAMQP API documentation",
+      "url": "https://docs.cloudamqp.com/"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://customer.cloudamqp.com/api",
+      "description": "Default base URL (pkg/cloudamqp/client.go DefaultBaseURL). Overridable via the connector's base-url config field."
+    }
+  ],
+  "security": [{ "ApiKeyBasic": [] }],
+  "paths": {
+    "/team": {
+      "get": {
+        "operationId": "listTeamMembers",
+        "summary": "List team members",
+        "description": "pkg/cloudamqp/client.go GetUsers. Returns the whole team in one response -- CloudAMQP does not paginate this endpoint and the connector sends no page or cursor parameters. GetUserByEmail and GetUserByID both call this and filter client-side, because the API has no per-user lookup.",
+        "responses": {
+          "200": {
+            "description": "Every member of the team. The array is the whole body, not wrapped in an envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/TeamMember" }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/team/{userId}": {
+      "put": {
+        "operationId": "updateTeamMemberRole",
+        "summary": "Update a team member's role",
+        "description": "pkg/cloudamqp/client.go UpdateUserRole. Body is form-encoded, not JSON. The connector does not decode the response.",
+        "parameters": [
+          {
+            "name": "userId",
+            "in": "path",
+            "required": true,
+            "description": "The member's id, as returned by listTeamMembers.",
+            "schema": { "type": "string" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "required": ["role"],
+                "properties": {
+                  "role": { "$ref": "#/components/schemas/Role" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Role updated. The connector passes a nil response target and does not decode the body." },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/team/invite": {
+      "post": {
+        "operationId": "inviteTeamMember",
+        "summary": "Invite a team member",
+        "description": "pkg/cloudamqp/client.go InviteUser. Body is form-encoded. The invitee must accept the emailed invitation before appearing in listTeamMembers, so a successful call does not immediately produce a member.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "required": ["email", "role"],
+                "properties": {
+                  "email": { "type": "string", "format": "email" },
+                  "role": { "$ref": "#/components/schemas/Role" },
+                  "tags[]": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Instance tags restricting the member's access. Sent as repeated tags[] fields so the server receives an array. Per CloudAMQP's docs, tags restrict which instances the member and monitor roles can reach."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Invitation sent. The connector does not decode the body." },
+          "400": {
+            "description": "Duplicate invite or malformed email. CloudAMQP uses 400 for both rather than 409.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } }
+          },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/team/remove": {
+      "post": {
+        "operationId": "removeTeamMember",
+        "summary": "Remove a team member",
+        "description": "pkg/cloudamqp/client.go RemoveUser. POST, not DELETE, and the member is addressed by email rather than id. CloudAMQP has no soft-disable, so this is a hard removal.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "required": ["email"],
+                "properties": {
+                  "email": { "type": "string", "format": "email" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Member removed. The connector does not decode the body." },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "ApiKeyBasic": {
+        "type": "http",
+        "scheme": "basic",
+        "description": "HTTP Basic with an empty username and the Customer API key as the password (pkg/cloudamqp/client.go constructAuth). The key is issued from the API Access page in the CloudAMQP console."
+      }
+    },
+    "responses": {
+      "Error": {
+        "description": "Error. Any status >= 300 is turned into an APIError by pkg/cloudamqp/helpers.go newAPIError, which carries the status code and the raw body.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } }
+      }
+    },
+    "schemas": {
+      "TeamMember": {
+        "type": "object",
+        "description": "Only the fields baton-cloudamqp reads. id is the user resource ID; email is the ExternalId provisioning addresses members by.",
+        "required": ["id", "email"],
+        "properties": {
+          "id": { "type": "string" },
+          "email": { "type": "string", "format": "email" },
+          "roles": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Role" },
+            "description": "Roles held by this member. Modelled as an array because the connector decodes []string, though the write side sets a single role."
+          }
+        }
+      },
+      "Role": {
+        "type": "string",
+        "description": "Team access role. The six values are documented at cloudamqp.com/docs/cloudamqp-user-access-control.html and enumerated in pkg/connector/role.go as teamAccessRoles.",
+        "enum": ["admin", "devops", "member", "monitor", "billing manager", "compliance manager"]
+      },
+      "ApiError": {
+        "type": "object",
+        "description": "Error body shape is not documented and the connector does not decode individual fields -- it records the status code and the raw body. Modelled as an open object rather than guessed at.",
+        "additionalProperties": true
+      }
+    }
+  }
+}
